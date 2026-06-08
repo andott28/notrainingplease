@@ -1,9 +1,7 @@
 import copy
 import json
 import os
-import re
 import threading
-import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -13,26 +11,14 @@ from typing import Any
 import requests
 
 from env_loader import load_dotenv
-from semantic_masking import IDENTIFIER_ENTITY_TYPES, MaskingEngine, RequestVault, SECRETISH_ENTITY_TYPES
+from intercept_core import handle_chat_completion_request
+from semantic_masking import MaskingEngine, RequestVault
 
 
 UPSTREAM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 VALID_PROTECTION_MODES = {"off", "balanced", "strict"}
 VALID_STRICT_BACKENDS = {"local", "reject"}
 VALID_MASKING_STRATEGIES = {"token_substitution", "opaque"}
-MASKING_SYSTEM_NOTE = (
-    "You are operating in privacy-preserving mode. "
-    "All user-supplied identifiers - variable names, constants, API keys, "
-    "paths, hostnames, emails, and similar tokens - have been replaced with "
-    "semantically-consistent aliases via a stable bijective mapping. "
-    "These aliases are valid, well-formed identifiers. Treat them as real names "
-    "and reason about the task structure and code logic normally. "
-    "Do not attempt to infer or recover the original names."
-)
-SENSITIVITY_MARKER_RX = re.compile(
-    r"\b(confidential|proprietary|internal only|do not share|private key|secret key|password|credential|api key)\b",
-    re.IGNORECASE,
-)
 
 
 def _parse_bool_env(name: str, default: bool) -> bool:
@@ -242,274 +228,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if body.get("stream") is True:
             self._write_json(400, {"error": {"message": "stream=true is not supported in v1"}})
             return
-        if "messages" not in body or not isinstance(body["messages"], list):
-            self._write_json(400, {"error": {"message": "messages must be a list"}})
-            return
-
-        if not self._authenticate(app.config):
-            return
-
-        sensitivity = self._classify_sensitivity(body["messages"], app.engine)
-        route_mode = self._resolve_route_mode(app.config.protection_mode, sensitivity)
-        session_id = self._session_id()
-
-        if route_mode == "strict":
-            strict_result = self._handle_strict_route(body, app.config, request_id, sensitivity)
-            self._write_json(strict_result["status"], strict_result["body"])
-            return
-
-        if route_mode == "off":
-            outbound_messages = body["messages"]
-            vault = RequestVault(request_id=request_id)
-        else:
-            vault = RequestVault(request_id=request_id)
-            app.session_vault_store.hydrate_vault(session_id, vault)
-            t0 = time.perf_counter()
-            outbound_messages = []
-            messages_to_mask = self._with_masking_system_note(body["messages"])
-            try:
-                for message in messages_to_mask:
-                    outbound_messages.append(app.engine.mask_message(message, vault))
-            except RuntimeError as exc:
-                self._write_json(
-                    422,
-                    {
-                        "error": {
-                            "message": f"Masking failed: {exc}",
-                            "type": "masking_failed",
-                            "request_id": request_id,
-                            "hint": "Set TOKEN_CIPHER_MODEL_ID to a valid tokenizer model for MASKING_STRATEGY=token_substitution.",
-                        }
-                    },
-                )
-                return
-            vault.timings_ms["mask_total"] = (time.perf_counter() - t0) * 1000.0
-            app.session_vault_store.merge_from_vault(session_id, vault)
-
-        outbound_payload = dict(body)
-        outbound_payload["stream"] = False
-        outbound_payload["model"] = body.get("model") or app.config.model
-        outbound_payload["messages"] = outbound_messages
-
-        upstream_result = self._call_upstream(outbound_payload, app.config)
-        if upstream_result["ok"] is False:
-            self._write_json(upstream_result["status"], upstream_result["body"])
-            return
-
-        response_body = upstream_result["body"]
-        if route_mode == "balanced":
-            t1 = time.perf_counter()
-            app.engine.unmask_response(response_body, vault)
-            vault.timings_ms["unmask_total"] = (time.perf_counter() - t1) * 1000.0
-        self._write_json(upstream_result["status"], response_body)
+        result = handle_chat_completion_request(
+            body,
+            {k: v for k, v in self.headers.items()},
+            request_id=request_id,
+            config=app.config,
+            engine=app.engine,
+            session_vault_store=app.session_vault_store,
+            upstream_sender=self._call_upstream,
+        )
+        self._write_json(result["status"], result["body"])
 
     def log_message(self, format: str, *args: Any) -> None:
         return
-
-    def _resolve_route_mode(self, protection_mode: str, sensitivity: dict[str, Any]) -> str:
-        if protection_mode == "off":
-            return "off"
-        if protection_mode == "strict":
-            return "strict"
-        return "strict" if sensitivity["strict_recommended"] else "balanced"
-
-    def _authenticate(self, config: Config) -> bool:
-        if not config.local_api_key and not config.api_key:
-            return True
-        auth = self.headers.get("Authorization", "").strip()
-        if not auth.startswith("Bearer "):
-            self._write_json(401, {"error": {"message": "Missing or invalid Authorization header"}})
-            return False
-        token = auth[len("Bearer "):].strip()
-        if not token:
-            self._write_json(401, {"error": {"message": "Missing or invalid Authorization header"}})
-            return False
-        if token == config.local_api_key or token == config.api_key:
-            return True
-        self._write_json(401, {"error": {"message": "Invalid API key"}})
-        return False
-
-    def _session_id(self) -> str:
-        session_id = self.headers.get("X-Session-ID", "").strip()
-        return session_id[:256]
-
-    def _with_masking_system_note(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        normalized = [copy.deepcopy(message) for message in messages]
-        system_index = -1
-        for idx, message in enumerate(normalized):
-            if isinstance(message, dict) and message.get("role") == "system":
-                system_index = idx
-                break
-        if system_index == -1:
-            return [{"role": "system", "content": MASKING_SYSTEM_NOTE}, *normalized]
-        system_message = normalized[system_index]
-        content = system_message.get("content")
-        if isinstance(content, str):
-            if MASKING_SYSTEM_NOTE not in content:
-                if content.strip():
-                    system_message["content"] = f"{content}\n\n{MASKING_SYSTEM_NOTE}"
-                else:
-                    system_message["content"] = MASKING_SYSTEM_NOTE
-            return normalized
-        if isinstance(content, list):
-            if not self._content_parts_have_masking_note(content):
-                content.append({"type": "text", "text": MASKING_SYSTEM_NOTE})
-            return normalized
-        system_message["content"] = MASKING_SYSTEM_NOTE
-        return normalized
-
-    def _content_parts_have_masking_note(self, content_parts: list[Any]) -> bool:
-        for part in content_parts:
-            if isinstance(part, dict) and part.get("type") == "text" and part.get("text") == MASKING_SYSTEM_NOTE:
-                return True
-        return False
-
-    def _extract_text_from_message(self, message: dict[str, Any]) -> str:
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
-                    parts.append(part["text"])
-            return "\n".join(parts)
-        return ""
-
-    def _classify_sensitivity(self, messages: list[dict[str, Any]], engine: MaskingEngine) -> dict[str, Any]:
-        entity_counts = engine.summarize_messages_entities(messages)
-        total_spans = sum(entity_counts.values())
-        secretish_spans = sum(entity_counts.get(t, 0) for t in SECRETISH_ENTITY_TYPES)
-        identifier_spans = sum(entity_counts.get(t, 0) for t in IDENTIFIER_ENTITY_TYPES)
-
-        combined_text = "\n".join(self._extract_text_from_message(message) for message in messages)
-        lowered = combined_text.lower()
-        char_count = len(combined_text)
-        tokenish_count = len(re.findall(r"\S+", combined_text))
-
-        marker_hits = len(SENSITIVITY_MARKER_RX.findall(combined_text))
-        has_code_fence = "```" in combined_text
-        has_large_text = char_count >= 2200
-        identifier_density = identifier_spans / max(1, tokenish_count)
-
-        strict_score = 0
-        signals: list[str] = []
-        if marker_hits > 0:
-            strict_score += 3
-            signals.append("sensitive_markers")
-        if has_large_text:
-            strict_score += 2
-            signals.append("large_text")
-        if has_code_fence and char_count >= 900:
-            strict_score += 2
-            signals.append("code_fence_large")
-        if total_spans >= 24:
-            strict_score += 2
-            signals.append("dense_sensitive_spans")
-        if secretish_spans >= 8:
-            strict_score += 1
-            signals.append("many_secretish_spans")
-        if identifier_density >= 0.08 and char_count >= 700:
-            strict_score += 1
-            signals.append("identifier_dense")
-        if "entire prompt" in lowered or "all words" in lowered or "mask everything" in lowered:
-            strict_score += 2
-            signals.append("whole_prompt_signal")
-
-        strict_recommended = strict_score >= 3
-        return {
-            "strict_recommended": strict_recommended,
-            "strict_score": strict_score,
-            "signals": signals,
-            "entity_counts": entity_counts,
-            "total_sensitive_spans": total_spans,
-            "secretish_spans": secretish_spans,
-            "identifier_spans": identifier_spans,
-            "char_count": char_count,
-        }
-
-    def _handle_strict_route(
-        self,
-        body: dict[str, Any],
-        config: Config,
-        request_id: str,
-        sensitivity: dict[str, Any],
-    ) -> dict[str, Any]:
-        if config.strict_backend == "reject":
-            return {
-                "status": 422,
-                "body": {
-                    "error": {
-                        "message": "Strict mode blocked remote forwarding because request sensitivity is high. Set STRICT_BACKEND=local or STRICT_LOCAL_URL for trusted local handling.",
-                        "type": "strict_mode_blocked",
-                        "request_id": request_id,
-                        "strict_score": sensitivity["strict_score"],
-                        "signals": sensitivity["signals"],
-                    }
-                },
-            }
-        return self._call_local_strict_backend(body, config, request_id, sensitivity)
-
-    def _call_local_strict_backend(
-        self,
-        body: dict[str, Any],
-        config: Config,
-        request_id: str,
-        sensitivity: dict[str, Any],
-    ) -> dict[str, Any]:
-        local_url = config.strict_local_url
-        if local_url:
-            payload = dict(body)
-            payload["stream"] = False
-            payload["model"] = body.get("model") or config.model
-            try:
-                resp = requests.post(
-                    local_url,
-                    headers={"Content-Type": "application/json", "Accept": "application/json"},
-                    json=payload,
-                    timeout=config.strict_local_timeout_s,
-                )
-                parsed = resp.json()
-                return {"status": resp.status_code, "body": parsed}
-            except Exception as exc:
-                return {
-                    "status": 502,
-                    "body": {
-                        "error": {
-                            "message": f"Strict local backend request failed: {exc}",
-                            "type": "strict_local_backend_failed",
-                            "request_id": request_id,
-                        }
-                    },
-                }
-
-        first_user_text = ""
-        for message in body.get("messages", []):
-            if isinstance(message, dict) and message.get("role") == "user":
-                first_user_text = self._extract_text_from_message(message)[:120]
-                break
-        local_body = {
-            "id": f"chatcmpl-strict-{request_id}",
-            "object": "chat.completion",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Strict mode handled this request locally. Configure STRICT_LOCAL_URL for full local model execution.",
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "strict_mode": {
-                "request_id": request_id,
-                "strict_score": sensitivity["strict_score"],
-                "signals": sensitivity["signals"],
-                "preview": first_user_text,
-            },
-        }
-        return {"status": 200, "body": local_body}
 
     def _read_json_body(self) -> dict[str, Any] | None:
         try:

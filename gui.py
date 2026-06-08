@@ -1,55 +1,29 @@
 import os
 import sys
+import json
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import uuid
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import proxy
+import transparent_mode
 
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 
-def _load_saved_key() -> str:
-    if not os.path.isfile(ENV_PATH):
-        return ""
-    with open(ENV_PATH, encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("NVIDIA_API_KEY="):
-                raw = line.split("=", 1)[1].strip().strip("\"'")
-                if raw:
-                    return raw
-    return ""
-
-
-def _save_key(key: str) -> None:
-    lines = []
-    found = False
-    if os.path.isfile(ENV_PATH):
-        with open(ENV_PATH, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.startswith("NVIDIA_API_KEY="):
-                    lines.append(f"NVIDIA_API_KEY={key}\n")
-                    found = True
-                else:
-                    lines.append(line)
-    if not found:
-        lines.append(f"NVIDIA_API_KEY={key}\n")
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-
 class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("Mask Proxy")
-        self.root.geometry("540x440")
+        self.root.title("LLM Shield")
+        self.root.geometry("900x600")
         self.root.resizable(False, False)
 
-        self._proxy_thread: threading.Thread | None = None
+        self._transparent_manager = transparent_mode.TransparentProxyManager()
+        self._provider_cache: dict[str, dict[str, object]] = {}
+        self._shield_enabled = tk.BooleanVar(value=False)
 
         self._build_setup()
         self._build_running()
@@ -59,70 +33,67 @@ class App:
         f = ttk.Frame(self.root, padding=20)
         self._setup_frame = f
 
-        ttk.Label(f, text="Mask Proxy", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(f, text="LLM Shield", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(f, text="").pack()
 
-        ttk.Label(f, text="Provider").pack(anchor="w")
-        self._provider_var = tk.StringVar(value="nvidia")
-        ttk.Combobox(f, textvariable=self._provider_var, values=["nvidia"], state="readonly", width=30).pack(anchor="w", fill="x")
+        ttk.Label(f, text="Shield Mode").pack(anchor="w")
+        ttk.Label(f, text="Transparent interception and redirect layer for detected LLM traffic.").pack(anchor="w")
         ttk.Label(f, text="").pack()
 
-        ttk.Label(f, text="API Key").pack(anchor="w")
-        key_row = ttk.Frame(f)
-        key_row.pack(anchor="w", fill="x")
-        self._api_key_var = tk.StringVar(value=_load_saved_key())
-        self._api_key_visible = tk.BooleanVar(value=False)
-        self._api_key_entry = ttk.Entry(key_row, textvariable=self._api_key_var, show="*", width=40)
-        self._api_key_entry.pack(side="left", fill="x", expand=True)
-        self._toggle_key_btn = ttk.Button(key_row, text="\U0001f441", width=3, command=self._toggle_key_visibility)
-        self._toggle_key_btn.pack(side="left", padx=(4, 0))
-        if not self._api_key_var.get():
-            self._api_key_entry.insert(0, "nvapi-...")
-            self._api_key_entry.config(foreground="gray")
-            self._api_key_entry.bind("<FocusIn>", self._on_key_focus, "+")
+        self._shield_toggle_btn = ttk.Button(f, text="Enable Shield", command=self._toggle_shield)
+        self._shield_toggle_btn.pack(anchor="w")
         ttk.Label(f, text="").pack()
 
-        self._start_btn = ttk.Button(f, text="Start", command=self._start)
-        self._start_btn.pack(anchor="w")
-
-        self._error_var = tk.StringVar()
-        ttk.Label(f, textvariable=self._error_var, foreground="red").pack(anchor="w")
-
-    def _on_key_focus(self, event: object = None) -> None:
-        if self._api_key_var.get() == "nvapi-...":
-            self._api_key_var.set("")
-            self._api_key_entry.config(foreground="black")
-
-    def _toggle_key_visibility(self) -> None:
-        self._api_key_visible.set(not self._api_key_visible.get())
-        self._api_key_entry.config(show="" if self._api_key_visible.get() else "*")
+        ttk.Label(f, text="Status").pack(anchor="w")
+        self._setup_status_var = tk.StringVar(value="Shield is off.")
+        ttk.Label(f, textvariable=self._setup_status_var).pack(anchor="w")
 
     def _build_running(self) -> None:
         f = ttk.Frame(self.root, padding=20)
         self._running_frame = f
 
-        ttk.Label(f, text="Mask Proxy", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(f, text="LLM Shield", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(f, text="").pack()
 
-        ttk.Label(f, text="Local API Key").pack(anchor="w")
-        self._local_key_var = tk.StringVar()
-        local_key_entry = ttk.Entry(f, textvariable=self._local_key_var, width=50, state="readonly")
-        local_key_entry.pack(anchor="w", fill="x")
+        ttk.Label(f, text="Shield control").pack(anchor="w")
+        self._shield_status_var = tk.StringVar(value="Disabled")
+        ttk.Label(f, textvariable=self._shield_status_var, foreground="green").pack(anchor="w")
         ttk.Label(f, text="").pack()
 
-        ttk.Label(f, text="Code snippet").pack(anchor="w")
-        self._snippet_text = tk.Text(f, height=8, width=60, wrap="none")
-        self._snippet_text.pack(anchor="w", fill="both")
+        ttk.Label(f, text="Detected providers").pack(anchor="w")
+        providers_split = ttk.Panedwindow(f, orient="horizontal")
+        providers_split.pack(anchor="w", fill="both", expand=True)
+
+        provider_list_frame = ttk.Frame(providers_split)
+        provider_detail_frame = ttk.Frame(providers_split)
+        providers_split.add(provider_list_frame, weight=1)
+        providers_split.add(provider_detail_frame, weight=2)
+
+        self._provider_tree = ttk.Treeview(provider_list_frame, columns=("hits", "redirected"), show="headings", selectmode="browse", height=10)
+        self._provider_tree.heading("hits", text="Hits")
+        self._provider_tree.heading("redirected", text="Redirected")
+        self._provider_tree.column("hits", width=70, anchor="center")
+        self._provider_tree.column("redirected", width=90, anchor="center")
+        self._provider_tree.pack(side="left", fill="both", expand=True)
+        provider_tree_scroll = ttk.Scrollbar(provider_list_frame, orient="vertical", command=self._provider_tree.yview)
+        provider_tree_scroll.pack(side="right", fill="y")
+        self._provider_tree.config(yscrollcommand=provider_tree_scroll.set)
+        self._provider_tree.bind("<<TreeviewSelect>>", self._on_provider_select)
+
+        ttk.Label(provider_detail_frame, text="Provider details").pack(anchor="w")
+        self._provider_detail_text = tk.Text(provider_detail_frame, height=12, width=60, wrap="word")
+        self._provider_detail_text.pack(fill="both", expand=True)
+        self._provider_detail_text.config(state="disabled")
         ttk.Label(f, text="").pack()
 
         btn_frame = ttk.Frame(f)
         btn_frame.pack(anchor="w")
-        self._stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop)
-        self._stop_btn.pack(side="left")
-        self._change_key_btn = ttk.Button(btn_frame, text="Change API Key", command=self._change_key)
-        self._change_key_btn.pack(side="left", padx=(10, 0))
+        self._toggle_shield_btn = ttk.Button(btn_frame, text="Toggle Shield", command=self._toggle_shield)
+        self._toggle_shield_btn.pack(side="left")
+        self._refresh_btn = ttk.Button(btn_frame, text="Refresh Providers", command=self._refresh_providers)
+        self._refresh_btn.pack(side="left", padx=(10, 0))
 
-        self._status_var = tk.StringVar(value="Proxy running on 127.0.0.1:8787")
+        self._status_var = tk.StringVar(value="Shield is disabled.")
         ttk.Label(f, textvariable=self._status_var, foreground="green").pack(anchor="w")
 
     def _show_setup(self) -> None:
@@ -132,43 +103,116 @@ class App:
     def _show_running(self) -> None:
         self._setup_frame.pack_forget()
         self._running_frame.pack(fill="both", expand=True)
+        self._refresh_providers()
 
-    def _start(self) -> None:
-        api_key = self._api_key_var.get().strip()
-        if not api_key or api_key == "nvapi-...":
-            self._error_var.set("Enter your NVIDIA API key.")
+    def _toggle_shield(self) -> None:
+        if self._transparent_manager.running:
+            self._transparent_manager.stop()
+            self._shield_enabled.set(False)
+            self._status_var.set("Shield is disabled.")
+            self._setup_status_var.set("Shield is off.")
+            self._shield_status_var.set("Disabled")
+            self._shield_toggle_btn.config(text="Enable Shield")
             return
-        self._error_var.set("")
-        _save_key(api_key)
-
-        local_token = "sk-local-" + uuid.uuid4().hex[:12]
-        os.environ["NVIDIA_API_KEY"] = api_key
-        os.environ["LOCAL_API_KEY"] = local_token
-
-        self._local_key_var.set(local_token)
-        snippet = (
-            "from openai import OpenAI\n\n"
-            "client = OpenAI(\n"
-            '    base_url="http://localhost:8787/v1",\n'
-            f'    api_key="{local_token}",\n'
-            ")\n"
+        config = transparent_mode.TransparentConfig(
+            api_key="",
+            model=os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k2.6"),
+            local_api_key=os.environ.get("LOCAL_API_KEY", "").strip(),
+            protection_mode=os.environ.get("PROTECTION_MODE", "balanced"),
+            strict_backend=os.environ.get("STRICT_BACKEND", "reject"),
+            strict_local_url=os.environ.get("STRICT_LOCAL_URL", ""),
+            strict_local_timeout_s=float(os.environ.get("STRICT_LOCAL_TIMEOUT_S", "30")),
         )
-        self._snippet_text.delete("1.0", "end")
-        self._snippet_text.insert("1.0", snippet)
-
-        self._proxy_thread = threading.Thread(target=lambda: proxy.run(quiet=True), daemon=True)
-        self._proxy_thread.start()
-
+        self._transparent_manager.start(config)
+        self._shield_enabled.set(True)
+        self._status_var.set("Shield is enabled.")
+        self._setup_status_var.set("Shield is on.")
+        self._shield_status_var.set("Enabled")
+        self._shield_toggle_btn.config(text="Disable Shield")
         self._show_running()
 
-    def _stop(self) -> None:
-        proxy.stop()
-        self._show_setup()
+    def _poll_providers(self) -> None:
+        if not self._transparent_manager.running:
+            return
+        self._refresh_providers()
+        self.root.after(2000, self._poll_providers)
 
-    def _change_key(self) -> None:
-        proxy.stop()
-        self._show_setup()
-        self._api_key_entry.focus()
+    def _refresh_providers(self) -> None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".agent", "detected_providers.json")
+        providers = {}
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                providers = data.get("providers", {})
+            except Exception as exc:
+                providers = {"__error__": {"provider_id": "__error__", "error": str(exc)}}
+
+        for item in self._provider_tree.get_children():
+            self._provider_tree.delete(item)
+
+        if isinstance(providers, dict) and providers:
+            for provider_id, info in sorted(
+                providers.items(),
+                key=lambda item: (int(item[1].get("redirected_hits", 0)), int(item[1].get("hits", 0))),
+                reverse=True,
+            ):
+                self._provider_tree.insert("", "end", iid=provider_id, values=(int(info.get("hits", 0)), int(info.get("redirected_hits", 0))))
+            current = self._provider_tree.selection()
+            if not current:
+                first = self._provider_tree.get_children()
+                if first:
+                    self._provider_tree.selection_set(first[0])
+                    self._provider_tree.focus(first[0])
+                    self._show_provider_details(first[0], providers)
+        else:
+            self._provider_tree.insert("", "end", iid="__empty__", values=(0, 0))
+            self._show_provider_details(None, providers)
+
+        self._provider_cache = providers
+
+    def _on_provider_select(self, event: object = None) -> None:
+        selection = self._provider_tree.selection()
+        if not selection:
+            return
+        self._show_provider_details(selection[0], getattr(self, "_provider_cache", {}))
+
+    def _show_provider_details(self, provider_id: str | None, providers: dict[str, dict[str, object]]) -> None:
+        details = []
+        if not provider_id or provider_id not in providers:
+            details.append("No provider selected.")
+        else:
+            info = providers[provider_id]
+            details.append(f"Provider: {provider_id}")
+            details.append(f"Hits: {info.get('hits', 0)}")
+            details.append(f"Redirected: {info.get('redirected_hits', 0)}")
+            last_seen = info.get("last_seen", 0)
+            try:
+                details.append(f"Last seen: {datetime.fromtimestamp(float(last_seen)).isoformat(sep=' ', timespec='seconds')}")
+            except Exception:
+                details.append(f"Last seen: {last_seen}")
+            details.append("")
+            details.append("Hosts:")
+            for host in info.get("hosts", []):
+                details.append(f"  - {host}")
+            details.append("")
+            details.append("Paths:")
+            for path in info.get("paths", []):
+                details.append(f"  - {path}")
+            details.append("")
+            details.append("Recent samples:")
+            samples = info.get("samples", [])
+            if samples:
+                for sample in samples[-5:]:
+                    details.append(
+                        f"  - {sample.get('host', '')}{sample.get('path', '')} | {sample.get('matched_by', '')} | {sample.get('action', '')}"
+                    )
+            else:
+                details.append("  - None")
+        self._provider_detail_text.config(state="normal")
+        self._provider_detail_text.delete("1.0", "end")
+        self._provider_detail_text.insert("1.0", "\n".join(details))
+        self._provider_detail_text.config(state="disabled")
 
     def run(self) -> None:
         self.root.mainloop()

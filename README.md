@@ -1,6 +1,6 @@
 # Mask Proxy
 
-A transparent local proxy that intercepts AI chat requests, automatically detects and masks sensitive data (API keys, URLs, emails, paths, UUIDs, identifiers) before forwarding to the upstream provider, then unmaskes the response.
+ A local proxy that intercepts AI chat requests, automatically detects sensitive data (API keys, URLs, emails, paths, UUIDs, identifiers), and blocks or masks it depending on mode.
 
 ## How it works
 
@@ -44,44 +44,35 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-**Windows users:** Double-click `run.bat` to launch the GUI.
+**Windows users:** Double-click `run.bat` to launch the shield UI.
 
 **Command line:**
+```bash
+python run.py
+```
+
+If you prefer the GUI directly:
 ```bash
 python gui.py
 ```
 
 ### Setup
 
-1. Select your **provider** (currently NVIDIA)
-2. Paste your **NVIDIA API Key**
-3. Click **Start**
-
-The proxy generates a local API key and listens on `http://localhost:8787/v1`.
-
-### Use with OpenAI Client
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:8787/v1",
-    api_key="sk-local-xxxx",  # shown in the GUI
-)
-
-completion = client.chat.completions.create(
-    model="qwen/qwen3-coder-480b-a35b-instruct",
-    messages=[{"role": "user", "content": "My password is secret123"}],
-)
-
-print(completion.choices[0].message.content)
-# The proxy masks "secret123" before it reaches NVIDIA and unmaskes the response.
-```
+1. Open the app.
+2. Click **Enable Shield**.
+3. Let the shield intercept detected LLM traffic system-wide.
 
 ### Controls
 
-- **Stop** — Stops the proxy
-- **Change API Key** — Stops the proxy and returns to setup screen (key is saved to `.env` for next launch)
+- **Enable Shield** — Starts system-wide transparent interception.
+- **Disable Shield** — Stops interception and restores normal egress.
+- **Refresh Providers** — Reloads the intercepted provider registry.
+
+## Transparent Mode
+
+Transparent mode is Windows-only in this build. It launches `mitmdump` in transparent mode, loads the local interception addon, and best-effort installs the mitmproxy root CA into the Windows trust store so HTTPS LLM calls can be inspected.
+
+Detected provider traffic is redirected through the proxy and logged to `.agent/detected_providers.json`. The GUI includes a live provider viewer and a detail pane so you can inspect hosts, paths, match reasons, and recent samples.
 
 ## Protection Modes
 

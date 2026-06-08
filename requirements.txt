@@ -1,3 +1,2 @@
 requests>=2.31
-transformers>=4.40
-openai>=1.0
+mitmproxy>=10.0
