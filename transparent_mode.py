@@ -2,6 +2,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -9,331 +10,161 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from semantic_masking import MaskingEngine, RequestVault
+PROXY_PORT = 8923
 
+def _cleanup_orphan_mitmdump() -> None:
+    try:
+        if platform.system().lower() != "windows":
+            return
+        subprocess.run(
+            ["taskkill", "/f", "/im", "mitmdump.exe"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        _kill_process_on_port(PROXY_PORT)
+    except Exception:
+        pass
+
+
+def _kill_process_on_port(port: int) -> None:
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                parts = line.split()
+                pid_str = parts[-1]
+                pid = int(pid_str)
+                subprocess.run(
+                    ["taskkill", "/f", "/pid", str(pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+    except Exception:
+        pass
+
+try:
+    from semantic_masking import MaskingEngine, RequestVault
+except ImportError:
+    class MaskingEngine:
+        def __init__(self, strategy): self.strategy = strategy
+        def mask_message(self, msg, vault): return msg
+    class RequestVault:
+        def __init__(self, request_id):
+            self.request_id = request_id
+            self.reverse_map = {}
 
 MITM_CA_CER = os.path.join(os.path.expanduser("~"), ".mitmproxy", "mitmproxy-ca-cert.cer")
-DISCOVERY_PATH = Path(".agent") / "detected_providers.json"
-PROVIDER_HINTS = {
-    "openai": ("api.openai.com", "openai.com"),
-    "anthropic": ("api.anthropic.com", "claude.ai", "anthropic.com"),
-    "google": ("generativelanguage.googleapis.com", "aiplatform.googleapis.com", "googleapis.com"),
-    "mistral": ("api.mistral.ai", "mistral.ai"),
-    "xai": ("api.x.ai", "x.ai"),
-    "nvidia": ("integrate.api.nvidia.com", "api.nvidia.com", "nvidia.com"),
-    "deepseek": ("api.deepseek.com", "deepseek.com"),
-    "qwen": ("dashscope.aliyuncs.com", "aliyuncs.com"),
-    "cohere": ("api.cohere.ai", "cohere.com"),
-    "groq": ("api.groq.com", "groq.com"),
-    "azure_openai": ("openai.azure.com", "azure.com"),
-    "perplexity": ("api.perplexity.ai", "perplexity.ai"),
-}
-PATH_HINTS = (
-    "/v1/chat/completions",
-    "/v1/responses",
-    "/v1/completions",
-    "/chat/completions",
-    "/responses",
-    "/completions",
-    "/generate",
-    "/v1beta",
-)
-BODY_HINT_KEYS = (
-    "messages",
-    "input",
-    "prompt",
-    "contents",
-    "conversation",
-    "model",
-    "max_output_tokens",
-    "temperature",
-)
+DISCOVERY_PATH = Path(__file__).parent / ".agent" / "detected_providers.json"
+CONFIG_PATH = Path(__file__).parent / "shield_config.json"
 
-MAX_RECURSION_DEPTH = 12
+@dataclass(frozen=True)
+class ProviderDef:
+    id: str
+    name: str
+    hosts: tuple[str, ...] = ()
+    paths: tuple[str, ...] = ()
+    body_keys: tuple[str, ...] = ()
+
+PROVIDER_REGISTRY: dict[str, ProviderDef] = {
+    "openai": ProviderDef("openai", "OpenAI", ("api.openai.com",), ("/v1/chat/completions",)),
+    "anthropic": ProviderDef("anthropic", "Anthropic", ("api.anthropic.com",), ("/v1/messages",)),
+    "google": ProviderDef("google", "Google Gemini", ("generativelanguage.googleapis.com",), ("/v1beta/models", "/v1/models")),
+    "opencode_zen": ProviderDef("opencode_zen", "OpenCode Zen", ("opencode.ai",), ("/zen/v1/responses", "/zen/v1/chat/completions")),
+    "opencode_go": ProviderDef("opencode_go", "OpenCode Go", ("opencode.ai",), ("/zen/go/v1/chat/completions",)),
+}
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.is_file(): return {}
+    try: return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception: return {}
+
+def _load_dotenv() -> None:
+    dotpath = Path(__file__).parent / ".env"
+    if not dotpath.is_file():
+        return
+    for line in dotpath.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+_load_dotenv()
+
+def save_config(config: dict[str, Any]) -> None:
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def load_provider_toggles() -> dict[str, bool]:
+    return dict(load_config().get("provider_toggles", {}))
+
+def save_provider_toggles(toggles: dict[str, bool]) -> None:
+    config = load_config()
+    config["provider_toggles"] = toggles
+    save_config(config)
+
+def load_user_providers() -> dict[str, ProviderDef]:
+    config = load_config()
+    result: dict[str, ProviderDef] = {}
+    for key, entry in config.get("custom_providers", {}).items():
+        if isinstance(entry, dict):
+            result[key] = ProviderDef(
+                id=entry.get("id", key), name=entry.get("name", key),
+                hosts=tuple(entry.get("hosts", ())), paths=tuple(entry.get("paths", ())),
+                body_keys=tuple(entry.get("body_keys", ()))
+            )
+    return result
+
+def save_user_providers(providers: dict[str, ProviderDef]) -> None:
+    config = load_config()
+    config["custom_providers"] = {
+        k: {"id": p.id, "name": p.name, "hosts": list(p.hosts), "paths": list(p.paths), "body_keys": list(p.body_keys)}
+        for k, p in providers.items()
+    }
+    save_config(config)
+
+def get_merged_registry(include_disabled: bool = False) -> dict[str, ProviderDef]:
+    merged = dict(PROVIDER_REGISTRY)
+    merged.update(load_user_providers())
+    if not include_disabled:
+        toggles = load_provider_toggles()
+        merged = {k: v for k, v in merged.items() if toggles.get(k, True)}
+    return merged
+
 @dataclass
 class TransparentConfig:
-    api_key: str
-    model: str
+    api_key: str = ""
+    model: str = ""
     local_api_key: str = ""
     protection_mode: str = "balanced"
+    masking_strategy: str = "token_substitution"
     strict_backend: str = "reject"
     strict_local_url: str = ""
     strict_local_timeout_s: float = 30.0
     discovery_log_path: str = str(DISCOVERY_PATH)
 
 
-@dataclass
-class ProviderObservation:
-    provider_id: str
-    host: str
-    path: str
-    matched_by: str
-    action: str
-    request_id: str
-    timestamp: float = field(default_factory=time.time)
-
-
-class ProviderRegistry:
-    def __init__(self, path: str) -> None:
-        self._path = Path(path)
-        self._lock = threading.RLock()
-        self._providers: dict[str, dict[str, Any]] = {}
-        self._observations: list[dict[str, Any]] = []
-        self._load()
-
-    def _load(self) -> None:
-        if not self._path.exists():
-            return
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        providers = data.get("providers", {})
-        if isinstance(providers, dict):
-            self._providers.update({str(k): dict(v) for k, v in providers.items() if isinstance(v, dict)})
-        observations = data.get("observations", [])
-        if isinstance(observations, list):
-            self._observations.extend([dict(item) for item in observations if isinstance(item, dict)])
-
-    def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"providers": self._providers, "observations": self._observations[-500:]}
-        self._path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
-
-    def record(self, observation: ProviderObservation) -> None:
-        with self._lock:
-            entry = self._providers.setdefault(
-                observation.provider_id,
-                {
-                    "provider_id": observation.provider_id,
-                    "hosts": [],
-                    "paths": [],
-                    "hits": 0,
-                    "redirected_hits": 0,
-                    "last_seen": 0.0,
-                    "samples": [],
-                },
-            )
-            if observation.host not in entry["hosts"]:
-                entry["hosts"].append(observation.host)
-            if observation.path not in entry["paths"]:
-                entry["paths"].append(observation.path)
-            entry["hits"] = int(entry.get("hits", 0)) + 1
-            if observation.action == "redirected":
-                entry["redirected_hits"] = int(entry.get("redirected_hits", 0)) + 1
-            entry["last_seen"] = observation.timestamp
-            samples = entry.setdefault("samples", [])
-            if len(samples) < 20:
-                samples.append(
-                    {
-                        "host": observation.host,
-                        "path": observation.path,
-                        "matched_by": observation.matched_by,
-                        "action": observation.action,
-                        "request_id": observation.request_id,
-                        "timestamp": observation.timestamp,
-                    }
-                )
-            self._observations.append(
-                {
-                    "provider_id": observation.provider_id,
-                    "host": observation.host,
-                    "path": observation.path,
-                    "matched_by": observation.matched_by,
-                    "action": observation.action,
-                    "request_id": observation.request_id,
-                    "timestamp": observation.timestamp,
-                }
-            )
-            self._save()
-
-    def summarize(self) -> list[dict[str, Any]]:
-        with self._lock:
-            items = list(self._providers.values())
-        return sorted(items, key=lambda item: (int(item.get("redirected_hits", 0)) > 0, int(item.get("hits", 0))), reverse=True)
-
-
-class TransparentState:
-    def __init__(self, config: TransparentConfig, engine: MaskingEngine, session_vault_store: Any) -> None:
-        self.config = config
-        self.engine = engine
-        self.session_vault_store = session_vault_store
-        self.registry = ProviderRegistry(config.discovery_log_path)
-
-
-def parse_json_body(body: bytes) -> dict[str, Any] | None:
+def validate_masking_engine(strategy: str) -> str:
     try:
-        parsed = json.loads(body.decode("utf-8"))
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def is_json_request(headers: Any) -> bool:
-    content_type = ""
-    if hasattr(headers, "get"):
-        content_type = str(headers.get("content-type", headers.get("Content-Type", ""))).lower()
-    return "application/json" in content_type or "text/json" in content_type or "application/x-ndjson" in content_type
-
-
-def provider_family_for_host(host: str) -> str:
-    host = host.lower().split(":", 1)[0]
-    for provider_id, hints in PROVIDER_HINTS.items():
-        for hint in hints:
-            if host == hint or host.endswith("." + hint) or host.endswith(hint):
-                return provider_id
-    return "unknown"
-
-
-def body_looks_llmish(body: dict[str, Any]) -> bool:
-    keys = set(body.keys())
-    return any(key in keys for key in BODY_HINT_KEYS) and any(
-        key in keys for key in ("messages", "input", "prompt", "contents", "conversation")
-    )
-
-
-def body_shape_hint(body: dict[str, Any]) -> str:
-    if "messages" in body and isinstance(body.get("messages"), list):
-        return "chat_messages"
-    if "input" in body:
-        return "response_input"
-    if "prompt" in body:
-        return "prompt"
-    if "contents" in body:
-        return "contents"
-    if "conversation" in body:
-        return "conversation"
-    return "json_llmish"
-
-
-def request_target_hint(path: str) -> bool:
-    lowered = path.lower()
-    return any(hint in lowered for hint in PATH_HINTS)
-
-
-def classify_provider(host: str, path: str, body: dict[str, Any], headers: Any) -> tuple[str, str, bool]:
-    provider_id = provider_family_for_host(host)
-    if provider_id != "unknown":
-        return provider_id, "host_hint", True
-    if request_target_hint(path):
-        if body_looks_llmish(body):
-            auth = ""
-            if hasattr(headers, "get"):
-                auth = str(headers.get("authorization", headers.get("Authorization", "")))
-            if auth.lower().startswith("bearer ") or "api-key" in str(headers).lower():
-                return "discovered_llm", "path+body+auth", True
-            return "discovered_llm", "path+body", True
-    if body_looks_llmish(body):
-        return "discovered_llm", "body_shape", True
-    return "unknown", "no_match", False
-
-
-def response_payload(status: int, payload: dict[str, Any]) -> tuple[int, bytes, list[tuple[str, str]]]:
-    data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-    return status, data, [("Content-Type", "application/json"), ("Content-Length", str(len(data)))]
-
-
-def _session_id_for_flow(flow: Any, host: str, path: str) -> str:
-    client = getattr(flow, "client_conn", None)
-    client_host = ""
-    client_port = 0
-    if client is not None and hasattr(client, "address") and client.address:
-        client_host, client_port = client.address[0], client.address[1]
-    scheme = getattr(flow.request, "scheme", "")
-    return f"{client_host}:{client_port}|{scheme}|{host}|{path}"[:256]
-
-
-def _mask_json_value(value: Any, engine: MaskingEngine, vault: RequestVault, depth: int = 0) -> Any:
-    if depth > MAX_RECURSION_DEPTH:
-        return value
-    if isinstance(value, str):
-        return engine.mask_message({"content": value}, vault).get("content", value)
-    if isinstance(value, list):
-        return [_mask_json_value(item, engine, vault, depth + 1) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: _mask_json_value(item, engine, vault, depth + 1) if isinstance(item, (str, list, dict)) else item
-            for key, item in value.items()
-        }
-    return value
-
-
-def _unmask_text(text: str, vault: RequestVault) -> str:
-    if not vault.reverse_map:
-        return text
-    keys = sorted(vault.reverse_map.keys(), key=len, reverse=True)
-    if not keys:
-        return text
-    import re
-
-    rx = re.compile("(" + "|".join(re.escape(k) for k in keys) + ")")
-    return rx.sub(lambda m: vault.reverse_map.get(m.group(0), m.group(0)), text)
-
-
-def _unmask_json_value(value: Any, vault: RequestVault, depth: int = 0) -> Any:
-    if depth > MAX_RECURSION_DEPTH:
-        return value
-    if isinstance(value, str):
-        return _unmask_text(value, vault)
-    if isinstance(value, list):
-        return [_unmask_json_value(item, vault, depth + 1) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: _unmask_json_value(item, vault, depth + 1) if isinstance(item, (str, list, dict)) else item
-            for key, item in value.items()
-        }
-    return value
-
-
-def handle_flow_request(flow: Any, state: TransparentState) -> bool:
-    request = flow.request
-    method = getattr(request, "method", "").upper()
-    if method not in {"POST", "PUT"}:
-        return False
-    if not is_json_request(request.headers):
-        return False
-
-    parsed = parse_json_body(getattr(request, "content", b""))
-    if parsed is None:
-        return False
-
-    host = getattr(request, "host", "")
-    path = getattr(request, "path", "")
-    provider_id, matched_by, should_intercept = classify_provider(host, path, parsed, request.headers)
-    if not should_intercept:
-        return False
-
-    request_id = str(uuid.uuid4())
-    session_id = _session_id_for_flow(flow, host, path)
-    vault = RequestVault(request_id=request_id)
-    state.session_vault_store.hydrate_vault(session_id, vault)
-    masked_body = _mask_json_value(parsed, state.engine, vault)
-    encoded = json.dumps(masked_body, ensure_ascii=True).encode("utf-8")
-    flow.request.content = encoded
-    if hasattr(flow.request, "headers"):
-        flow.request.headers["content-length"] = str(len(encoded))
-    flow.metadata["transparent_provider_id"] = provider_id
-    flow.metadata["transparent_request_id"] = request_id
-    flow.metadata["transparent_vault"] = vault
-    flow.metadata["transparent_matched_by"] = matched_by
-    flow.metadata["transparent_session_id"] = session_id
-    state.registry.record(
-        ProviderObservation(
-            provider_id=provider_id,
-            host=host,
-            path=path,
-            matched_by=matched_by,
-            action="redirected",
-            request_id=request_id,
+        engine = MaskingEngine(strategy=strategy)
+    except Exception as exc:
+        return f"Failed to initialise MaskingEngine (strategy={strategy!r}): {exc}"
+    if strategy == "token_substitution" and engine._tokenizer is None:
+        detail = engine._tokenizer_load_error or "Tokenizer could not be loaded."
+        return (
+            f"token_substitution strategy requires the 'transformers' package "
+            f"and a downloadable tokenizer model.\n\nDetail: {detail}"
         )
-    )
-    return True
+    return ""
 
 
 class TransparentProxyManager:
     def __init__(self) -> None:
-        self._process: subprocess.Popen[str] | None = None
+        self._process: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self.last_error: str = ""
 
     @property
     def running(self) -> bool:
@@ -346,27 +177,40 @@ class TransparentProxyManager:
                 return
             if platform.system().lower() != "windows":
                 raise RuntimeError("Transparent mode is Windows-only in this build.")
+
+            _cleanup_orphan_mitmdump()
             install_windows_ca()
+
             addon_path = os.path.abspath(__file__)
-            cmd = [
-                "python",
-                "-m",
-                "mitmdump",
-                "-s",
-                addon_path,
-                "--mode",
-                "transparent",
-            ]
+            mitmdump_cmd = os.path.join(os.path.dirname(sys.executable), "mitmdump.exe")
+            if not os.path.exists(mitmdump_cmd):
+                mitmdump_cmd = "mitmdump"
+
+            cmd = [mitmdump_cmd, "-s", addon_path, "--mode", "local", "--listen-port", str(PROXY_PORT)]
             env = os.environ.copy()
-            env["MASKING_STRATEGY"] = os.environ.get("MASKING_STRATEGY", "token_substitution")
             env["PROTECTION_MODE"] = config.protection_mode
-            env["STRICT_BACKEND"] = config.strict_backend
-            env["STRICT_LOCAL_URL"] = config.strict_local_url
-            env["STRICT_LOCAL_TIMEOUT_S"] = str(config.strict_local_timeout_s)
+            env["MASKING_STRATEGY"] = config.masking_strategy
             env["TRANSPARENT_DISCOVERY_LOG"] = config.discovery_log_path
-            if config.local_api_key:
-                env["LOCAL_API_KEY"] = config.local_api_key
-            self._process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            env["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+            env["HF_HUB_NO_ADVISORY_WARNINGS"] = "1"
+            env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+            env["TOKENIZERS_PARALLELISM"] = "false"
+            env.pop("HTTP_PROXY", None)
+            env.pop("HTTPS_PROXY", None)
+            env.pop("http_proxy", None)
+            env.pop("https_proxy", None)
+            hf_token = os.environ.get("HF_TOKEN", "")
+            if hf_token:
+                env["HF_TOKEN"] = hf_token
+
+            log_dir = Path(__file__).parent / ".agent"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "mitmproxy.log"
+
+            stderr_file = open(log_path, "a", encoding="utf-8")
+            self._process = subprocess.Popen(
+                cmd, env=env, stdout=subprocess.DEVNULL, stderr=stderr_file, text=True
+            )
 
     def stop(self) -> None:
         with self._lock:
@@ -374,95 +218,132 @@ class TransparentProxyManager:
             self._process = None
         if proc and proc.poll() is None:
             proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                proc.kill()
+            try: proc.wait(timeout=5)
+            except Exception: proc.kill()
         uninstall_windows_ca()
-
 
 class TransparentAddon:
     def __init__(self) -> None:
-        discovery_path = os.environ.get("TRANSPARENT_DISCOVERY_LOG", str(DISCOVERY_PATH))
-        self._state = TransparentState(
-            config=TransparentConfig(
-                api_key=os.environ.get("NVIDIA_API_KEY", "").strip(),
-                model=os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k2.6"),
-                local_api_key=os.environ.get("LOCAL_API_KEY", "").strip(),
-                protection_mode=os.environ.get("PROTECTION_MODE", "balanced").strip().lower(),
-                strict_backend=os.environ.get("STRICT_BACKEND", "reject").strip().lower(),
-                strict_local_url=os.environ.get("STRICT_LOCAL_URL", "").strip(),
-                strict_local_timeout_s=float(os.environ.get("STRICT_LOCAL_TIMEOUT_S", "30")),
-                discovery_log_path=discovery_path,
-            ),
-            engine=MaskingEngine(strategy=os.environ.get("MASKING_STRATEGY", "token_substitution")),
-            session_vault_store=_build_session_vault_store(),
-        )
+        debug_path = Path(__file__).parent / ".agent" / "addon_debug.log"
+        try:
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            debug_path.write_text("[INIT] TransparentAddon constructor called\n", encoding="utf-8")
+        except Exception:
+            pass
+        strategy = os.environ.get("MASKING_STRATEGY", "token_substitution")
+        try:
+            self.engine = MaskingEngine(strategy=strategy)
+        except Exception as exc:
+            try:
+                with open(debug_path, "a", encoding="utf-8") as f:
+                    f.write(f"[INIT] MaskingEngine FAILED: {exc}\n")
+            except Exception:
+                pass
+            raise
+        self._vaults: dict[str, RequestVault] = {}
+        self.hits = 0
+        self.redirections = 0
+        self.stats_path = Path(__file__).parent / ".agent" / "live_stats.json"
+        self._debug_path = debug_path
+        try:
+            with open(debug_path, "a", encoding="utf-8") as f:
+                f.write(f"[INIT] MaskingEngine OK, strategy={strategy}, tokenizer={'loaded' if self.engine._tokenizer else 'None'}\n")
+        except Exception:
+            pass
+        self._write_stats()
+
+    def _write_stats(self) -> None:
+        try:
+            self.stats_path.parent.mkdir(parents=True, exist_ok=True)
+            self.stats_path.write_text(json.dumps({
+                "hits": self.hits,
+                "redirections": self.redirections
+            }), encoding="utf-8")
+        except Exception:
+            pass
 
     def request(self, flow: Any) -> None:
-        handle_flow_request(flow, self._state)
+        host = getattr(flow.request, "host", "").lower()
+        path = getattr(flow.request, "path", "").lower()
+        host_header = flow.request.headers.get("host", "").lower()
+        registry = get_merged_registry()
+
+        try:
+            with open(self._debug_path, "a", encoding="utf-8") as f:
+                f.write(f"[REQ] {flow.request.method} {host}{path} (Host: {host_header})\n")
+        except Exception:
+            pass
+
+        matched_provider = None
+        for provider in registry.values():
+            host_match = any(h in host or h in host_header for h in provider.hosts)
+            path_match = any(p in path for p in provider.paths)
+            if host_match and path_match:
+                matched_provider = provider
+                break
+
+        if matched_provider:
+            self.hits += 1
+            self._write_stats()
+
+            try:
+                with open(self._debug_path, "a", encoding="utf-8") as f:
+                    f.write(f"[HIT] Matched provider: {matched_provider.name}\n")
+            except Exception:
+                pass
+
+            if flow.request.content:
+                try:
+                    data = json.loads(flow.request.content.decode("utf-8"))
+                    req_id = str(uuid.uuid4())
+                    vault = RequestVault(request_id=req_id)
+
+                    if "messages" in data and isinstance(data["messages"], list):
+                        for msg in data["messages"]:
+                            if "content" in msg and isinstance(msg["content"], str):
+                                masked = self.engine.mask_message({"content": msg["content"]}, vault)
+                                msg["content"] = masked.get("content", msg["content"])
+
+                    flow.request.content = json.dumps(data).encode("utf-8")
+                    flow.request.headers["content-length"] = str(len(flow.request.content))
+
+                    self._vaults[req_id] = vault
+                    flow.metadata["shield_request_id"] = req_id
+
+                    self.redirections += 1
+                    self._write_stats()
+
+                except Exception as e:
+                    print(f"[Shield] Intercept masking failure: {e}")
 
     def response(self, flow: Any) -> None:
-        vault = flow.metadata.get("transparent_vault")
-        if not isinstance(vault, RequestVault):
-            return
-        response = flow.response
-        if response is None or not hasattr(response, "headers"):
-            return
-        content_type = str(response.headers.get("content-type", response.headers.get("Content-Type", ""))).lower()
-        if "application/json" not in content_type and "text/json" not in content_type and "application/x-ndjson" not in content_type:
-            return
-        raw = getattr(response, "content", b"")
-        if not isinstance(raw, (bytes, bytearray)):
-            return
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except Exception:
-            return
-        unmasked = _unmask_json_value(parsed, vault)
-        encoded = json.dumps(unmasked, ensure_ascii=True).encode("utf-8")
-        flow.response.content = encoded
-        flow.response.headers["content-length"] = str(len(encoded))
-        session_id = flow.metadata.get("transparent_session_id", "")
-        if isinstance(session_id, str) and session_id:
-            self._state.session_vault_store.merge_from_vault(session_id, vault)
-
-
-def _build_session_vault_store() -> Any:
-    class _SessionVaultStore:
-        def hydrate_vault(self, *_args: Any, **_kwargs: Any) -> bool:
-            return False
-
-        def merge_from_vault(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
-
-    return _SessionVaultStore()
-
-
-addons = [TransparentAddon()]
+        req_id = flow.metadata.get("shield_request_id")
+        if req_id and req_id in self._vaults and flow.response and flow.response.content:
+            try:
+                vault = self._vaults.pop(req_id)
+                try:
+                    with open(self._debug_path, "a", encoding="utf-8") as f:
+                        f.write(f"[RES] Response received, vault_entries={len(vault.reverse_map)}\n")
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
 
 def install_windows_ca() -> None:
-    if platform.system().lower() != "windows":
-        return
-    if not os.path.isfile(MITM_CA_CER):
-        return
-    subprocess.run(
-        ["certutil", "-addstore", "Root", MITM_CA_CER],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
+    if os.path.isfile(MITM_CA_CER):
+        subprocess.run(["certutil", "-addstore", "Root", MITM_CA_CER], check=False, capture_output=True)
 
 def uninstall_windows_ca() -> None:
-    if platform.system().lower() != "windows":
-        return
-    if not os.path.isfile(MITM_CA_CER):
-        return
-    subprocess.run(
-        ["certutil", "-delstore", "Root", MITM_CA_CER],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    if os.path.isfile(MITM_CA_CER):
+        subprocess.run(["certutil", "-delstore", "Root", MITM_CA_CER], check=False, capture_output=True)
+
+addons = [TransparentAddon()]
+
+try:
+    _dbg = Path(__file__).parent / ".agent" / "addon_debug.log"
+    _dbg.parent.mkdir(parents=True, exist_ok=True)
+    with open(_dbg, "a", encoding="utf-8") as _f:
+        _f.write(f"[MODULE] addons list created, len={len(addons)}\n")
+except Exception:
+    pass

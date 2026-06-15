@@ -2,10 +2,15 @@ import builtins
 import json
 import hashlib
 import keyword
+import logging
 import os
+import platform
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
 PRIORITY_ORDER = [
@@ -352,6 +357,29 @@ class MaskingEngine:
         if not model_id:
             self._tokenizer = None
             return
+        saved_env = {}
+        proxy_keys = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
+        for key in proxy_keys:
+            if key in os.environ:
+                saved_env[key] = os.environ.pop(key)
+        if platform.system().lower() == "windows":
+            try:
+                import winreg
+                internet_settings = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, internet_settings, 0, winreg.KEY_READ)
+                try:
+                    saved_proxy_enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+                    saved_proxy_server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                    winreg.CloseKey(key)
+                    wkey = winreg.OpenKey(winreg.HKEY_CURRENT_USER, internet_settings, 0, winreg.KEY_SET_VALUE)
+                    winreg.SetValueEx(wkey, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+                    winreg.CloseKey(wkey)
+                    saved_env["__win_proxy_enable__"] = saved_proxy_enable
+                    saved_env["__win_proxy_server__"] = saved_proxy_server
+                except FileNotFoundError:
+                    winreg.CloseKey(key)
+            except Exception:
+                pass
         try:
             from transformers import AutoTokenizer
 
@@ -377,6 +405,21 @@ class MaskingEngine:
         except Exception as exc:
             self._tokenizer = None
             self._tokenizer_load_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            for key, val in saved_env.items():
+                if key.startswith("__win_"):
+                    continue
+                os.environ[key] = val
+            if platform.system().lower() == "windows" and "__win_proxy_enable__" in saved_env:
+                try:
+                    import winreg
+                    internet_settings = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, internet_settings, 0, winreg.KEY_SET_VALUE)
+                    winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, saved_env["__win_proxy_enable__"])
+                    winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, saved_env.get("__win_proxy_server__", ""))
+                    winreg.CloseKey(key)
+                except Exception:
+                    pass
 
     def _build_token_buckets(self) -> None:
         if self._tokenizer is None:

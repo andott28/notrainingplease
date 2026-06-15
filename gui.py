@@ -1,222 +1,248 @@
+import json
 import os
 import sys
-import json
 import threading
+import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk, messagebox
-import uuid
-from datetime import datetime
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import transparent_mode
 
+BG, BG_LIGHT, BG_HOVER = "#1a1b26", "#24283b", "#2f3347"
+FG, FG_DIM, ACCENT, ACCENT_DIM = "#c0caf5", "#565f89", "#9ece6a", "#3d5941"
+TOGGLE_ON, TOGGLE_OFF, DOT_ON, DOT_OFF = "#9ece6a", "#3b3f57", "#9ece6a", "#565f89"
 
-ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+def draw_shield(canvas: tk.Canvas, cx: int, cy: int, size: int, color: str) -> None:
+    s = size
+    top, bot, mid = cy - s * 0.45, cy + s * 0.45, cy + s * 0.05
+    left, right = cx - s * 0.38, cx + s * 0.38
+    canvas.delete("shield")
+    points = [cx, top, right, top + s * 0.18, right, mid, cx, bot, left, mid, left, top + s * 0.18]
+    canvas.create_polygon(points, fill=color, outline="", tags="shield")
 
+def draw_toggle(canvas: tk.Canvas, x: int, y: int, on: bool) -> None:
+    canvas.delete("toggle")
+    w, h = 40, 20
+    r = h // 2
+    color = TOGGLE_ON if on else TOGGLE_OFF
+    canvas.create_arc(x, y, x + h, y + h, start=90, extent=180, fill=color, outline="", tags="toggle")
+    canvas.create_arc(x + w - h, y, x + w, y + h, start=270, extent=180, fill=color, outline="", tags="toggle")
+    canvas.create_rectangle(x + r, y, x + w - r, y + h, fill=color, outline="", tags="toggle")
+    knob_x = x + w - r if on else x + r
+    canvas.create_oval(knob_x - 7, y + 3, knob_x + 7, y + h - 3, fill="#c0caf5", outline="", tags="toggle")
 
 class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("LLM Shield")
-        self.root.geometry("900x600")
+        self.root.geometry("520x640")
         self.root.resizable(False, False)
+        self.root.configure(bg=BG)
 
-        self._transparent_manager = transparent_mode.TransparentProxyManager()
-        self._provider_cache: dict[str, dict[str, object]] = {}
-        self._shield_enabled = tk.BooleanVar(value=False)
+        self._manager = transparent_mode.TransparentProxyManager()
+        self._shield_on = tk.BooleanVar(value=False)
+        self._toggles: dict[str, tk.BooleanVar] = {}
+        self._build_ui()
+        self._load_toggles()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._build_setup()
-        self._build_running()
-        self._show_setup()
+    def _on_close(self) -> None:
+        if self._shield_on.get():
+            self._stop_shield()
+        self.root.destroy()
 
-    def _build_setup(self) -> None:
-        f = ttk.Frame(self.root, padding=20)
-        self._setup_frame = f
+    def _build_ui(self) -> None:
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(".", background=BG, foreground=FG, fieldbackground=BG_LIGHT)
+        style.configure("TFrame", background=BG)
+        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"), background=BG, foreground=FG)
+        style.configure("Sub.TLabel", font=("Segoe UI", 10), background=BG, foreground=FG_DIM)
+        style.configure("Status.TLabel", font=("Segoe UI", 11), background=BG, foreground=ACCENT)
+        style.configure("Provider.TLabel", font=("Segoe UI", 11), background=BG_LIGHT, foreground=FG)
+        style.configure("Dim.TLabel", font=("Segoe UI", 9), background=BG, foreground=FG_DIM)
+        style.configure("Add.TButton", font=("Segoe UI", 12, "bold"), foreground=ACCENT, background=BG_LIGHT)
+        style.configure("ShieldOff.TButton", font=("Segoe UI", 12, "bold"), foreground=FG, background=BG_HOVER)
+        style.configure("Shield.TButton", font=("Segoe UI", 12, "bold"), foreground=FG, background=ACCENT_DIM)
 
-        ttk.Label(f, text="LLM Shield", font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(f, text="").pack()
+        top = ttk.Frame(self.root)
+        top.pack(fill="x", padx=20, pady=(16, 0))
 
-        ttk.Label(f, text="Shield Mode").pack(anchor="w")
-        ttk.Label(f, text="Transparent interception and redirect layer for detected LLM traffic.").pack(anchor="w")
-        ttk.Label(f, text="").pack()
+        self._shield_canvas = tk.Canvas(top, width=48, height=48, bg=BG, highlightthickness=0)
+        self._shield_canvas.pack(side="left")
+        draw_shield(self._shield_canvas, 24, 24, 48, FG_DIM)
 
-        self._shield_toggle_btn = ttk.Button(f, text="Enable Shield", command=self._toggle_shield)
-        self._shield_toggle_btn.pack(anchor="w")
-        ttk.Label(f, text="").pack()
+        title_frame = ttk.Frame(top)
+        title_frame.pack(side="left", padx=(10, 0), fill="x", expand=True)
+        ttk.Label(title_frame, text="LLM Shield", style="Title.TLabel").pack(anchor="w")
+        self._status_label = ttk.Label(title_frame, text="Shield off", style="Sub.TLabel")
+        self._status_label.pack(anchor="w")
 
-        ttk.Label(f, text="Status").pack(anchor="w")
-        self._setup_status_var = tk.StringVar(value="Shield is off.")
-        ttk.Label(f, textvariable=self._setup_status_var).pack(anchor="w")
+        self.telemetry_frame = ttk.Frame(title_frame)
+        self.telemetry_frame.pack(anchor="w", pady=(4, 0))
 
-    def _build_running(self) -> None:
-        f = ttk.Frame(self.root, padding=20)
-        self._running_frame = f
+        self._hits_label = ttk.Label(self.telemetry_frame, text="Hits: 0", font=("Segoe UI", 9, "bold"), foreground=FG)
+        self._hits_label.pack(side="left", padx=(0, 10))
 
-        ttk.Label(f, text="LLM Shield", font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(f, text="").pack()
+        self._redir_label = ttk.Label(self.telemetry_frame, text="Masked Redirections: 0", font=("Segoe UI", 9, "bold"), foreground=ACCENT)
+        self._redir_label.pack(side="left")
 
-        ttk.Label(f, text="Shield control").pack(anchor="w")
-        self._shield_status_var = tk.StringVar(value="Disabled")
-        ttk.Label(f, textvariable=self._shield_status_var, foreground="green").pack(anchor="w")
-        ttk.Label(f, text="").pack()
+        self._shield_btn = ttk.Button(top, text="Enable", style="ShieldOff.TButton", command=self._toggle_shield, width=10)
+        self._shield_btn.pack(side="right")
 
-        ttk.Label(f, text="Detected providers").pack(anchor="w")
-        providers_split = ttk.Panedwindow(f, orient="horizontal")
-        providers_split.pack(anchor="w", fill="both", expand=True)
+        sep = tk.Frame(self.root, height=1, bg=FG_DIM)
+        sep.pack(fill="x", padx=20, pady=(12, 0))
 
-        provider_list_frame = ttk.Frame(providers_split)
-        provider_detail_frame = ttk.Frame(providers_split)
-        providers_split.add(provider_list_frame, weight=1)
-        providers_split.add(provider_detail_frame, weight=2)
+        prov_header = ttk.Frame(self.root)
+        prov_header.pack(fill="x", padx=20, pady=(12, 0))
+        ttk.Label(prov_header, text="Active Providers", style="Sub.TLabel", font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Button(prov_header, text="+", style="Add.TButton", width=3, command=self._add_provider_dialog).pack(side="right")
 
-        self._provider_tree = ttk.Treeview(provider_list_frame, columns=("hits", "redirected"), show="headings", selectmode="browse", height=10)
-        self._provider_tree.heading("hits", text="Hits")
-        self._provider_tree.heading("redirected", text="Redirected")
-        self._provider_tree.column("hits", width=70, anchor="center")
-        self._provider_tree.column("redirected", width=90, anchor="center")
-        self._provider_tree.pack(side="left", fill="both", expand=True)
-        provider_tree_scroll = ttk.Scrollbar(provider_list_frame, orient="vertical", command=self._provider_tree.yview)
-        provider_tree_scroll.pack(side="right", fill="y")
-        self._provider_tree.config(yscrollcommand=provider_tree_scroll.set)
-        self._provider_tree.bind("<<TreeviewSelect>>", self._on_provider_select)
+        list_frame = tk.Frame(self.root, bg=BG_LIGHT, highlightthickness=1, highlightbackground=FG_DIM)
+        list_frame.pack(fill="both", expand=True, padx=20, pady=(8, 16))
 
-        ttk.Label(provider_detail_frame, text="Provider details").pack(anchor="w")
-        self._provider_detail_text = tk.Text(provider_detail_frame, height=12, width=60, wrap="word")
-        self._provider_detail_text.pack(fill="both", expand=True)
-        self._provider_detail_text.config(state="disabled")
-        ttk.Label(f, text="").pack()
+        canvas = tk.Canvas(list_frame, bg=BG_LIGHT, highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        self._provider_frame = tk.Frame(canvas, bg=BG_LIGHT)
 
-        btn_frame = ttk.Frame(f)
-        btn_frame.pack(anchor="w")
-        self._toggle_shield_btn = ttk.Button(btn_frame, text="Toggle Shield", command=self._toggle_shield)
-        self._toggle_shield_btn.pack(side="left")
-        self._refresh_btn = ttk.Button(btn_frame, text="Refresh Providers", command=self._refresh_providers)
-        self._refresh_btn.pack(side="left", padx=(10, 0))
+        self._provider_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self._provider_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
-        self._status_var = tk.StringVar(value="Shield is disabled.")
-        ttk.Label(f, textvariable=self._status_var, foreground="green").pack(anchor="w")
+        self.stats_file = Path(__file__).parent / ".agent" / "live_stats.json"
+        self._poll_telemetry_metrics()
 
-    def _show_setup(self) -> None:
-        self._running_frame.pack_forget()
-        self._setup_frame.pack(fill="both", expand=True)
+    def _load_toggles(self) -> None:
+        saved = transparent_mode.load_provider_toggles()
+        all_providers = transparent_mode.get_merged_registry(include_disabled=True)
+        for pid in all_providers:
+            if pid not in self._toggles:
+                self._toggles[pid] = tk.BooleanVar(value=saved.get(pid, True))
+        self._rebuild_provider_list()
 
-    def _show_running(self) -> None:
-        self._setup_frame.pack_forget()
-        self._running_frame.pack(fill="both", expand=True)
-        self._refresh_providers()
+    def _rebuild_provider_list(self) -> None:
+        for w in self._provider_frame.winfo_children(): w.destroy()
+        all_providers = transparent_mode.get_merged_registry(include_disabled=True)
+        
+        for pid, pdef in all_providers.items():
+            row = tk.Frame(self._provider_frame, bg=BG_LIGHT)
+            row.pack(fill="x", padx=4, pady=2)
+
+            lbl = ttk.Label(row, text=pdef.name, style="Provider.TLabel")
+            lbl.pack(side="left", padx=10, pady=8)
+
+            tc = tk.Canvas(row, width=40, height=20, bg=BG_LIGHT, highlightthickness=0, cursor="hand2")
+            tc.pack(side="right", padx=10, pady=8)
+            is_on = self._toggles[pid].get()
+            draw_toggle(tc, 0, 0, is_on)
+
+            def make_click_callback(p_id=pid, canvas_obj=tc):
+                return lambda e: self._on_toggle_click(p_id, canvas_obj)
+
+            tc.bind("<Button-1>", make_click_callback())
+
+    def _on_toggle_click(self, pid: str, canvas: tk.Canvas) -> None:
+        new_val = not self._toggles[pid].get()
+        self._toggles[pid].set(new_val)
+        draw_toggle(canvas, 0, 0, new_val)
+        toggles = {k: v.get() for k, v in self._toggles.items()}
+        transparent_mode.save_provider_toggles(toggles)
 
     def _toggle_shield(self) -> None:
-        if self._transparent_manager.running:
-            self._transparent_manager.stop()
-            self._shield_enabled.set(False)
-            self._status_var.set("Shield is disabled.")
-            self._setup_status_var.set("Shield is off.")
-            self._shield_status_var.set("Disabled")
-            self._shield_toggle_btn.config(text="Enable Shield")
+        if self._shield_on.get():
+            self._stop_shield()
+        else:
+            self._shield_btn.config(state="disabled")
+            threading.Thread(target=self._async_start_shield, daemon=True).start()
+
+    def _async_start_shield(self) -> None:
+        strategy = os.environ.get("MASKING_STRATEGY", "token_substitution")
+        validation_error = transparent_mode.validate_masking_engine(strategy)
+        if validation_error:
+            self.root.after(0, lambda: messagebox.showerror("Masking Engine Error", validation_error))
+            self.root.after(0, lambda: self._shield_btn.config(state="normal"))
             return
         config = transparent_mode.TransparentConfig(
-            api_key="",
-            model=os.environ.get("NVIDIA_MODEL", "moonshotai/kimi-k2.6"),
-            local_api_key=os.environ.get("LOCAL_API_KEY", "").strip(),
-            protection_mode=os.environ.get("PROTECTION_MODE", "balanced"),
-            strict_backend=os.environ.get("STRICT_BACKEND", "reject"),
-            strict_local_url=os.environ.get("STRICT_LOCAL_URL", ""),
-            strict_local_timeout_s=float(os.environ.get("STRICT_LOCAL_TIMEOUT_S", "30")),
+            protection_mode="balanced",
+            masking_strategy=strategy,
         )
-        self._transparent_manager.start(config)
-        self._shield_enabled.set(True)
-        self._status_var.set("Shield is enabled.")
-        self._setup_status_var.set("Shield is on.")
-        self._shield_status_var.set("Enabled")
-        self._shield_toggle_btn.config(text="Disable Shield")
-        self._show_running()
-
-    def _poll_providers(self) -> None:
-        if not self._transparent_manager.running:
-            return
-        self._refresh_providers()
-        self.root.after(2000, self._poll_providers)
-
-    def _refresh_providers(self) -> None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".agent", "detected_providers.json")
-        providers = {}
-        if os.path.isfile(path):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    data = json.load(f)
-                providers = data.get("providers", {})
-            except Exception as exc:
-                providers = {"__error__": {"provider_id": "__error__", "error": str(exc)}}
-
-        for item in self._provider_tree.get_children():
-            self._provider_tree.delete(item)
-
-        if isinstance(providers, dict) and providers:
-            for provider_id, info in sorted(
-                providers.items(),
-                key=lambda item: (int(item[1].get("redirected_hits", 0)), int(item[1].get("hits", 0))),
-                reverse=True,
-            ):
-                self._provider_tree.insert("", "end", iid=provider_id, values=(int(info.get("hits", 0)), int(info.get("redirected_hits", 0))))
-            current = self._provider_tree.selection()
-            if not current:
-                first = self._provider_tree.get_children()
-                if first:
-                    self._provider_tree.selection_set(first[0])
-                    self._provider_tree.focus(first[0])
-                    self._show_provider_details(first[0], providers)
-        else:
-            self._provider_tree.insert("", "end", iid="__empty__", values=(0, 0))
-            self._show_provider_details(None, providers)
-
-        self._provider_cache = providers
-
-    def _on_provider_select(self, event: object = None) -> None:
-        selection = self._provider_tree.selection()
-        if not selection:
-            return
-        self._show_provider_details(selection[0], getattr(self, "_provider_cache", {}))
-
-    def _show_provider_details(self, provider_id: str | None, providers: dict[str, dict[str, object]]) -> None:
-        details = []
-        if not provider_id or provider_id not in providers:
-            details.append("No provider selected.")
-        else:
-            info = providers[provider_id]
-            details.append(f"Provider: {provider_id}")
-            details.append(f"Hits: {info.get('hits', 0)}")
-            details.append(f"Redirected: {info.get('redirected_hits', 0)}")
-            last_seen = info.get("last_seen", 0)
-            try:
-                details.append(f"Last seen: {datetime.fromtimestamp(float(last_seen)).isoformat(sep=' ', timespec='seconds')}")
-            except Exception:
-                details.append(f"Last seen: {last_seen}")
-            details.append("")
-            details.append("Hosts:")
-            for host in info.get("hosts", []):
-                details.append(f"  - {host}")
-            details.append("")
-            details.append("Paths:")
-            for path in info.get("paths", []):
-                details.append(f"  - {path}")
-            details.append("")
-            details.append("Recent samples:")
-            samples = info.get("samples", [])
-            if samples:
-                for sample in samples[-5:]:
-                    details.append(
-                        f"  - {sample.get('host', '')}{sample.get('path', '')} | {sample.get('matched_by', '')} | {sample.get('action', '')}"
-                    )
+        try:
+            self._manager.start(config)
+            time.sleep(1.5)  # Let mitmdump bind cleanly backgrounded
+            if self._manager.running:
+                self.root.after(0, self._sync_start_success)
             else:
-                details.append("  - None")
-        self._provider_detail_text.config(state="normal")
-        self._provider_detail_text.delete("1.0", "end")
-        self._provider_detail_text.insert("1.0", "\n".join(details))
-        self._provider_detail_text.config(state="disabled")
+                self.root.after(0, lambda: messagebox.showerror("Error", "Proxy process crashed."))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+
+    def _sync_start_success(self) -> None:
+        self._shield_on.set(True)
+        self._shield_btn.config(text="Disable", style="Shield.TButton", state="normal")
+        self._status_label.config(text="Shield active", style="Status.TLabel")
+        draw_shield(self._shield_canvas, 24, 24, 48, ACCENT)
+
+    def _stop_shield(self) -> None:
+        self._manager.stop()
+        self._shield_on.set(False)
+        self._shield_btn.config(text="Enable", style="ShieldOff.TButton")
+        self._status_label.config(text="Shield off", style="Sub.TLabel")
+        draw_shield(self._shield_canvas, 24, 24, 48, FG_DIM)
+
+    def _poll_telemetry_metrics(self) -> None:
+        if self._shield_on.get() and self.stats_file.is_file():
+            try:
+                stats = json.loads(self.stats_file.read_text(encoding="utf-8"))
+                hits = stats.get("hits", 0)
+                redirections = stats.get("redirections", 0)
+                self._hits_label.config(text=f"Hits: {hits}")
+                self._redir_label.config(text=f"Masked Redirections: {redirections}")
+            except Exception:
+                pass
+        else:
+            if not self._shield_on.get():
+                self._hits_label.config(text="Hits: 0")
+                self._redir_label.config(text="Masked Redirections: 0")
+                if self.stats_file.is_file():
+                    try: self.stats_file.unlink()
+                    except Exception: pass
+        self.root.after(500, self._poll_telemetry_metrics)
+
+    def _add_provider_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Domain Filter")
+        dialog.geometry("360x180")
+        dialog.configure(bg=BG)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Filter Label", style="Sub.TLabel").pack(anchor="w", padx=20, pady=(10,2))
+        name_ent = tk.Entry(dialog, bg=BG_LIGHT, fg=FG, insertbackground=FG, relief="flat")
+        name_ent.pack(fill="x", padx=20)
+
+        ttk.Label(dialog, text="Target URL Host Domain", style="Sub.TLabel").pack(anchor="w", padx=20, pady=(10,2))
+        host_ent = tk.Entry(dialog, bg=BG_LIGHT, fg=FG, insertbackground=FG, relief="flat")
+        host_ent.pack(fill="x", padx=20)
+
+        def append_provider():
+            n, h = name_ent.get().strip(), host_ent.get().strip()
+            if n and h:
+                pid = n.lower().replace(" ", "_")
+                p_dict = transparent_mode.load_user_providers()
+                p_dict[pid] = transparent_mode.ProviderDef(id=pid, name=n, hosts=(h,), paths=("/chat",))
+                transparent_mode.save_user_providers(p_dict)
+                self._toggles[pid] = tk.BooleanVar(value=True)
+                self._load_toggles()
+                dialog.destroy()
+
+        tk.Button(dialog, text="Add Filter", bg=ACCENT_DIM, fg=FG, command=append_provider, relief="flat").pack(pady=15)
 
     def run(self) -> None:
         self.root.mainloop()
-
 
 if __name__ == "__main__":
     App().run()

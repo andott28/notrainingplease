@@ -144,13 +144,19 @@ SESSION_VAULT_MAX_SESSIONS=1000
 ```
 run.bat                  ← double-click to launch (Windows)
 gui.py                   ← Tkinter GUI for easy setup
-proxy.py                 ← HTTP proxy server
+transparent_mode.py      ← transparent proxy and provider detection
 semantic_masking.py      ← masking engine
-env_loader.py            ← .env file loader
+shield_config.example.json ← example custom provider config
 .env.example             ← configuration reference
 requirements.txt         ← Python dependencies
 LICENSE                  ← MIT license
 ```
+
+## Custom Providers
+
+The shield auto-detects 17 built-in LLM providers with toggle switches. Click any provider to enable/disable detection. To add a custom provider, click "+" and enter just a Name and Host — that's it.
+
+Provider toggle states and custom providers are saved to `shield_config.json`.
 
 ## License
 

@@ -1,0 +1,22 @@
+{
+  "provider_toggles": {
+    "openai": true,
+    "anthropic": true,
+    "google": true,
+    "mistral": true,
+    "deepseek": true,
+    "nvidia": true,
+    "groq": true,
+    "opencode_zen": true,
+    "opencode_go": true
+  },
+  "custom_providers": {
+    "my_custom_api": {
+      "id": "my_custom_api",
+      "name": "My Custom API",
+      "hosts": ["api.mycompany.com"],
+      "paths": ["/v1/chat/completions"],
+      "body_keys": ["messages", "model"]
+    }
+  }
+}
