@@ -101,6 +101,39 @@ PROTECTION_MODE=balanced
 MASKING_STRATEGY=token_substitution
 ```
 
+## Semantic Obfuscation
+
+An additional, **orthogonal** protection mode. It re-encodes the prompt at the **token level** using a persisted, per-deployment random codebook, so the upstream model still sees a semantically equivalent sequence of token IDs while the raw surface form becomes unreadable to humans and to plaintext log scrapers.
+
+This is **not** entity masking (which only swaps identifiers) and **not** synonym replacement (which keeps words readable). It is a whole-sentence token-stream substitution. The mapping is bijective and keyed on the tokenizer's own embedding space, so the model receives a stream that lands in nearly the same point in semantic space as the original — same reasoning, same answer, but the prompt looks scrambled to a human reader.
+
+**Configure in `.env`:**
+```env
+SEMANTIC_OBFUSCATION=false
+SEMANTIC_OBFUSCATION_LEVEL=standard   # light | standard | aggressive
+SEMANTIC_OBFUSCATION_ANCHOR_MODEL=   # defaults to TOKEN_CIPHER_MODEL_ID
+SEMANTIC_OBFUSCATION_CODEBOOK_PATH=.agent/semantic_codebook.json
+SEMANTIC_OBFUSCATION_INCLUDE_SYSTEM=false
+SEMANTIC_OBFUSCATION_LOAD_ANCHOR_BODY=true
+SEMANTIC_OBFUSCATION_DECODE_RESPONSE=false
+```
+
+**How it works:**
+
+1. On first startup, the obfuscator loads the embedding matrix of the anchor model (or a smaller fallback embedder if `LOAD_ANCHOR_BODY=false`) and builds a one-to-one mapping from each vocab token to a near-cosine-similar token of the same syntactic class but visually different surface form.
+2. The mapping is deterministic (salted hash → same source always picks the same surrogate) and persisted to `.agent/semantic_codebook.json` so it stays stable across restarts.
+3. On every intercepted request, each `user` / `assistant` message is re-tokenized, the source token IDs are replaced with their surrogate IDs, and the resulting token sequence is decoded back to text. The system message is left intact (so any system note the upstream sees stays readable) unless `INCLUDE_SYSTEM=true`.
+4. The mapping is stored per-request in the `RequestVault`, so the same prompt produces the same obfuscation across the request.
+5. On the response, the existing `unmask_response` pass restores the entity-masking aliases, and an optional `DECODE_RESPONSE=true` pass also reverses the semantic obfuscation in the model's reply.
+
+**Knobs:**
+
+- `LEVEL` trades readability for behavior stability: `light` is the closest to source (highest cosine), `aggressive` is the most scrambled. `standard` is the default and is calibrated for typical chat traffic.
+- `LOAD_ANCHOR_BODY=false` skips the model body download (~3 GB) and uses a smaller fallback embedder. This weakens the cosine-similarity guarantee.
+- `DECODE_RESPONSE=true` also reverses the encoding on the model's response. **Off by default.** Response decoding can introduce false-positive substitutions on common English tokens whose ID happens to equal one of the prompt's surrogate IDs. Enable only if you have measured the tradeoff in your own traffic.
+
+**Important limit:** nothing here prevents the upstream provider from training on the obfuscated stream after re-tokenizing it. The obfuscation makes the *raw surface* harder to learn from, but the token IDs themselves are normal vocab IDs and a determined provider can reconstruct the same embedding-space stream. This is a fundamental limit of any client-side scrambling approach.
+
 ## Configuration Reference
 
 See `.env.example` for all available options:
@@ -146,6 +179,7 @@ run.bat                  ← double-click to launch (Windows)
 gui.py                   ← Tkinter GUI for easy setup
 transparent_mode.py      ← transparent proxy and provider detection
 semantic_masking.py      ← masking engine
+semantic_obfuscation.py  ← token-level semantic obfuscation engine
 shield_config.example.json ← example custom provider config
 .env.example             ← configuration reference
 requirements.txt         ← Python dependencies

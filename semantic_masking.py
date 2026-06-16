@@ -114,6 +114,10 @@ class RequestVault:
     masked_counts: dict[str, int] = field(default_factory=dict)
     token_forward_map: dict[int, int] = field(default_factory=dict)
     token_reverse_map: dict[int, int] = field(default_factory=dict)
+    semantic_forward: dict[int, int] = field(default_factory=dict)
+    semantic_reverse: dict[int, int] = field(default_factory=dict)
+    semantic_tokens_processed: int = 0
+    semantic_tokens_unmapped: int = 0
 
 
 class MaskingEngine:
@@ -160,6 +164,12 @@ class MaskingEngine:
                     new_parts.append(part)
             out["content"] = new_parts
         return out
+
+    def get_tokenizer(self) -> Any:
+        return self._tokenizer
+
+    def tokenizer_loaded(self) -> bool:
+        return self._tokenizer is not None
 
     def summarize_messages_entities(
         self,

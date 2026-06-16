@@ -167,9 +167,33 @@ class App:
             self.root.after(0, lambda: messagebox.showerror("Masking Engine Error", validation_error))
             self.root.after(0, lambda: self._shield_btn.config(state="normal"))
             return
+        sem_enabled = os.environ.get("SEMANTIC_OBFUSCATION", "false").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        sem_level = os.environ.get("SEMANTIC_OBFUSCATION_LEVEL", "standard").strip().lower() or "standard"
+        sem_anchor = os.environ.get("SEMANTIC_OBFUSCATION_ANCHOR_MODEL", "").strip()
+        sem_codebook_path = os.environ.get(
+            "SEMANTIC_OBFUSCATION_CODEBOOK_PATH", ".agent/semantic_codebook.json"
+        ).strip()
+        sem_include_system = os.environ.get("SEMANTIC_OBFUSCATION_INCLUDE_SYSTEM", "false").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        sem_load_body = os.environ.get("SEMANTIC_OBFUSCATION_LOAD_ANCHOR_BODY", "true").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        sem_decode_response = os.environ.get("SEMANTIC_OBFUSCATION_DECODE_RESPONSE", "false").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
         config = transparent_mode.TransparentConfig(
             protection_mode="balanced",
             masking_strategy=strategy,
+            semantic_obfuscation=sem_enabled,
+            semantic_obfuscation_level=sem_level,
+            semantic_obfuscation_anchor_model=sem_anchor,
+            semantic_obfuscation_codebook_path=sem_codebook_path,
+            semantic_obfuscation_include_system=sem_include_system,
+            semantic_obfuscation_load_anchor_body=sem_load_body,
+            semantic_obfuscation_decode_response=sem_decode_response,
         )
         try:
             self._manager.start(config)

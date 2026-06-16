@@ -54,6 +54,12 @@ except ImportError:
             self.request_id = request_id
             self.reverse_map = {}
 
+try:
+    from semantic_obfuscation import SemanticCodebook, SemanticObfuscator
+except ImportError:
+    SemanticCodebook = None  # type: ignore[assignment,misc]
+    SemanticObfuscator = None  # type: ignore[assignment,misc]
+
 MITM_CA_CER = os.path.join(os.path.expanduser("~"), ".mitmproxy", "mitmproxy-ca-cert.cer")
 DISCOVERY_PATH = Path(__file__).parent / ".agent" / "detected_providers.json"
 CONFIG_PATH = Path(__file__).parent / "shield_config.json"
@@ -144,6 +150,13 @@ class TransparentConfig:
     strict_local_url: str = ""
     strict_local_timeout_s: float = 30.0
     discovery_log_path: str = str(DISCOVERY_PATH)
+    semantic_obfuscation: bool = False
+    semantic_obfuscation_level: str = "standard"
+    semantic_obfuscation_anchor_model: str = ""
+    semantic_obfuscation_codebook_path: str = ""
+    semantic_obfuscation_include_system: bool = False
+    semantic_obfuscation_load_anchor_body: bool = True
+    semantic_obfuscation_decode_response: bool = False
 
 
 def validate_masking_engine(strategy: str) -> str:
@@ -191,6 +204,21 @@ class TransparentProxyManager:
             env["PROTECTION_MODE"] = config.protection_mode
             env["MASKING_STRATEGY"] = config.masking_strategy
             env["TRANSPARENT_DISCOVERY_LOG"] = config.discovery_log_path
+            env["SEMANTIC_OBFUSCATION"] = "true" if config.semantic_obfuscation else "false"
+            env["SEMANTIC_OBFUSCATION_LEVEL"] = config.semantic_obfuscation_level
+            env["SEMANTIC_OBFUSCATION_ANCHOR_MODEL"] = config.semantic_obfuscation_anchor_model
+            env["SEMANTIC_OBFUSCATION_CODEBOOK_PATH"] = (
+                config.semantic_obfuscation_codebook_path or ".agent/semantic_codebook.json"
+            )
+            env["SEMANTIC_OBFUSCATION_INCLUDE_SYSTEM"] = (
+                "true" if config.semantic_obfuscation_include_system else "false"
+            )
+            env["SEMANTIC_OBFUSCATION_LOAD_ANCHOR_BODY"] = (
+                "true" if config.semantic_obfuscation_load_anchor_body else "false"
+            )
+            env["SEMANTIC_OBFUSCATION_DECODE_RESPONSE"] = (
+                "true" if config.semantic_obfuscation_decode_response else "false"
+            )
             env["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
             env["HF_HUB_NO_ADVISORY_WARNINGS"] = "1"
             env["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -250,6 +278,50 @@ class TransparentAddon:
                 f.write(f"[INIT] MaskingEngine OK, strategy={strategy}, tokenizer={'loaded' if self.engine._tokenizer else 'None'}\n")
         except Exception:
             pass
+
+        self.obfuscator: SemanticObfuscator | None = None
+        sem_enabled = os.environ.get("SEMANTIC_OBFUSCATION", "false").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if sem_enabled and SemanticObfuscator is not None and SemanticCodebook is not None:
+            try:
+                anchor_model = (
+                    os.environ.get("SEMANTIC_OBFUSCATION_ANCHOR_MODEL", "").strip()
+                    or os.environ.get("TOKEN_CIPHER_MODEL_ID", "").strip()
+                )
+                level = os.environ.get("SEMANTIC_OBFUSCATION_LEVEL", "standard").strip().lower() or "standard"
+                codebook_path = os.environ.get(
+                    "SEMANTIC_OBFUSCATION_CODEBOOK_PATH", ".agent/semantic_codebook.json"
+                ).strip()
+                load_body = os.environ.get("SEMANTIC_OBFUSCATION_LOAD_ANCHOR_BODY", "true").strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
+                tokenizer = self.engine.get_tokenizer() if self.engine.tokenizer_loaded() else None
+                codebook = SemanticCodebook(
+                    tokenizer=tokenizer,
+                    anchor_model_id=anchor_model or "unknown",
+                    level=level,
+                    load_anchor_model_body=load_body,
+                    path=codebook_path,
+                )
+                self.obfuscator = SemanticObfuscator(codebook=codebook, tokenizer=tokenizer)
+                if not codebook.ready:
+                    codebook.bootstrap_async()
+                try:
+                    with open(debug_path, "a", encoding="utf-8") as f:
+                        f.write(
+                            f"[INIT] SemanticObfuscator OK, level={level}, anchor={anchor_model}, ready={self.obfuscator.ready}\n"
+                        )
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    with open(debug_path, "a", encoding="utf-8") as f:
+                        f.write(f"[INIT] SemanticObfuscator FAILED: {exc}\n")
+                except Exception:
+                    pass
+                self.obfuscator = None
+
         self._write_stats()
 
     def _write_stats(self) -> None:
@@ -299,10 +371,25 @@ class TransparentAddon:
                     vault = RequestVault(request_id=req_id)
 
                     if "messages" in data and isinstance(data["messages"], list):
+                        include_system = os.environ.get("SEMANTIC_OBFUSCATION_INCLUDE_SYSTEM", "false").strip().lower() in {
+                            "1", "true", "yes", "on",
+                        }
                         for msg in data["messages"]:
+                            if not isinstance(msg, dict):
+                                continue
                             if "content" in msg and isinstance(msg["content"], str):
                                 masked = self.engine.mask_message({"content": msg["content"]}, vault)
                                 msg["content"] = masked.get("content", msg["content"])
+                            if self.obfuscator is not None and self.obfuscator.ready:
+                                role = msg.get("role", "")
+                                if include_system or role in {"user", "assistant"}:
+                                    encoded_msg = self.obfuscator.encode_message(
+                                        {"role": role, "content": msg.get("content", "")},
+                                        vault,
+                                        include_system=include_system,
+                                    )
+                                    if isinstance(encoded_msg.get("content"), str):
+                                        msg["content"] = encoded_msg["content"]
 
                     flow.request.content = json.dumps(data).encode("utf-8")
                     flow.request.headers["content-length"] = str(len(flow.request.content))
@@ -326,6 +413,37 @@ class TransparentAddon:
                         f.write(f"[RES] Response received, vault_entries={len(vault.reverse_map)}\n")
                 except Exception:
                     pass
+                try:
+                    decoded_body = json.loads(flow.response.content.decode("utf-8"))
+                except Exception:
+                    decoded_body = None
+                if isinstance(decoded_body, dict):
+                    try:
+                        self.engine.unmask_response(decoded_body, vault)
+                    except Exception as exc:
+                        try:
+                            with open(self._debug_path, "a", encoding="utf-8") as f:
+                                f.write(f"[RES] unmask_response failed: {exc}\n")
+                        except Exception:
+                            pass
+                    if self.obfuscator is not None and self.obfuscator.ready:
+                        decode_response = os.environ.get(
+                            "SEMANTIC_OBFUSCATION_DECODE_RESPONSE", "false"
+                        ).strip().lower() in {"1", "true", "yes", "on"}
+                        if decode_response:
+                            try:
+                                self.obfuscator.decode_response(decoded_body, vault)
+                            except Exception as exc:
+                                try:
+                                    with open(self._debug_path, "a", encoding="utf-8") as f:
+                                        f.write(f"[RES] obfuscator.decode_response failed: {exc}\n")
+                                except Exception:
+                                    pass
+                    try:
+                        flow.response.content = json.dumps(decoded_body).encode("utf-8")
+                        flow.response.headers["content-length"] = str(len(flow.response.content))
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
