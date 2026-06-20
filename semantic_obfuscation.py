@@ -372,7 +372,7 @@ class SemanticCodebook:
             result[group_key] = [tid for _, tid in items]
         return result
 
-    def _lookup_candidates(self, shape_index: dict[tuple[int,int], list[int]], token_id: int, source_token: str, vocab_size: int, special_ids: set[int], max_candidates: int = 50) -> list[int]:
+    def _lookup_candidates(self, shape_index: dict[tuple[int,int], list[int]], token_id: int, source_token: str, vocab_size: int, special_ids: set[int], max_candidates: int = 20) -> list[int]:
         source_key = _token_shape_key(source_token)
         group_key = (source_key[0], source_key[1])
         source_bucket = source_key[2]
@@ -429,11 +429,7 @@ class SemanticCodebook:
             for t in all_tokens
         ]
         shape_index = self._build_shape_index(vocab_size, special_ids)
-        t_start = time.time()
-        TIMEOUT_SECONDS = 30
         for token_id in range(vocab_size):
-            if time.time() - t_start > TIMEOUT_SECONDS:
-                break
             if not is_obfuscatable[token_id]:
                 if all_tokens[token_id] and all_tokens[token_id].strip() and all_tokens[token_id] in PROTECTED_IDENTIFIERS:
                     skipped_protected += 1
@@ -448,7 +444,7 @@ class SemanticCodebook:
                 scored: list[tuple[float, int]] = []
                 checked = 0
                 for cand_id in raw_candidates:
-                    if checked >= 50:
+                    if checked >= 20:
                         break
                     if cand_id == token_id or not is_obfuscatable[cand_id]:
                         continue
@@ -495,7 +491,7 @@ class SemanticCodebook:
                 scored = []
                 checked = 0
                 for cand_id in raw_candidates:
-                    if checked >= 50:
+                    if checked >= 20:
                         break
                     if cand_id == token_id or not is_obfuscatable[cand_id]:
                         continue
@@ -537,7 +533,7 @@ class SemanticCodebook:
             scored = []
             checked = 0
             for cand_id in raw_candidates:
-                if checked >= 50:
+                if checked >= 20:
                     break
                 if cand_id == token_id or not is_obfuscatable[cand_id]:
                     continue

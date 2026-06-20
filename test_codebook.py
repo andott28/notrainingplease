@@ -69,7 +69,7 @@ def bootstrap():
     print(f"  bootstrap() took {elapsed:.1f}s")
 
     if record:
-        s = record.stats
+        s = cb._record.stats
         print(f"  SUCCESS:")
         print(f"    Anchored:        {s.anchored_tokens}")
         print(f"    Vocab:           {s.vocab_size}")
