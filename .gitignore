@@ -6,3 +6,5 @@ __pycache__/
 build/
 dist/
 *.exe
+.agent/*.log
+.agent/live_stats.json
