@@ -393,6 +393,7 @@ class MaskingEngine:
         try:
             from transformers import AutoTokenizer
 
+            os.environ["HF_HUB_OFFLINE"] = "1"
             tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=True)
             self._tokenizer = tokenizer
             self._token_cipher_secret = f"{model_id}-local-cipher"

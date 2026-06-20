@@ -143,6 +143,7 @@ class _AnchorEmbedder:
     def load(self) -> None:
         if self._backend != "uninitialized":
             return
+        os.environ["HF_HUB_OFFLINE"] = "1"
         try:
             from transformers import AutoTokenizer
             self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True, trust_remote_code=True)
@@ -349,6 +350,51 @@ class SemanticCodebook:
         name = getattr(self._tokenizer, "name_or_path", "") or ""
         return str(name)
 
+    def _build_shape_index(self, vocab_size: int, special_ids: set[int]) -> dict[tuple[int,int], list[int]]:
+        index: dict[tuple[int,int], list[int]] = {}
+        for token_id in range(vocab_size):
+            if token_id in special_ids:
+                continue
+            token = self._safe_token_str(token_id)
+            if not token or self._is_protected_token(token):
+                continue
+            key = _token_shape_key(token)
+            group_key = (key[0], key[1])
+            bucket = key[2]
+            candidates = index.get(group_key)
+            if candidates is None:
+                index[group_key] = [(bucket, token_id)]
+            else:
+                candidates.append((bucket, token_id))
+        result: dict[tuple[int,int], list[int]] = {}
+        for group_key, items in index.items():
+            items.sort(key=lambda x: x[0])
+            result[group_key] = [tid for _, tid in items]
+        return result
+
+    def _lookup_candidates(self, shape_index: dict[tuple[int,int], list[int]], token_id: int, source_token: str, vocab_size: int, special_ids: set[int], max_candidates: int = 50) -> list[int]:
+        source_key = _token_shape_key(source_token)
+        group_key = (source_key[0], source_key[1])
+        source_bucket = source_key[2]
+        candidates = shape_index.get(group_key, [])
+        if not candidates:
+            return []
+        result: list[int] = []
+        for cand_id in candidates:
+            if len(result) >= max_candidates:
+                break
+            if cand_id == token_id or cand_id in special_ids:
+                continue
+            cand_token = self._safe_token_str(cand_id)
+            if not cand_token or cand_token == source_token:
+                continue
+            if self._is_protected_token(cand_token):
+                continue
+            cand_bucket = _token_shape_key(cand_token)[2]
+            if abs(cand_bucket - source_bucket) <= 2:
+                result.append(cand_id)
+        return result
+
     def _build_record(self) -> CodebookRecord | None:
         if self._tokenizer is None:
             self._bootstrap_error = "tokenizer unavailable"
@@ -376,31 +422,43 @@ class SemanticCodebook:
         skipped_visual = 0
         min_visual = self._level_to_visual_distance()
         top_k = self._level_to_neighbor_count()
+        all_tokens: list[str] = [self._safe_token_str(i) for i in range(vocab_size)]
+        token_shapes: list[tuple[int,int,int]] = [_token_shape_key(t) if t else (0,0,0) for t in all_tokens]
+        is_obfuscatable: list[bool] = [
+            bool(t) and t not in special_ids and not self._is_protected_token(t)
+            for t in all_tokens
+        ]
+        shape_index = self._build_shape_index(vocab_size, special_ids)
+        t_start = time.time()
+        TIMEOUT_SECONDS = 30
         for token_id in range(vocab_size):
-            if token_id in special_ids:
+            if time.time() - t_start > TIMEOUT_SECONDS:
+                break
+            if not is_obfuscatable[token_id]:
+                if all_tokens[token_id] and all_tokens[token_id].strip() and all_tokens[token_id] in PROTECTED_IDENTIFIERS:
+                    skipped_protected += 1
                 continue
-            source_token = self._safe_token_str(token_id)
-            if not source_token:
-                continue
-            if self._is_protected_token(source_token):
-                skipped_protected += 1
-                continue
+            source_token = all_tokens[token_id]
             if use_real_embedding:
                 source_vec = vectors_or_matrix[token_id]
-                candidates = self._candidate_token_ids(
-                    token_id, vocab_size, special_ids, source_token
-                )
-                if not candidates:
-                    continue
+                source_key = token_shapes[token_id]
+                group_key = (source_key[0], source_key[1])
+                source_bucket = source_key[2]
+                raw_candidates = shape_index.get(group_key, [])
                 scored: list[tuple[float, int]] = []
-                for cand_id in candidates:
-                    if cand_id == token_id:
+                checked = 0
+                for cand_id in raw_candidates:
+                    if checked >= 50:
+                        break
+                    if cand_id == token_id or not is_obfuscatable[cand_id]:
                         continue
-                    cand_token = self._safe_token_str(cand_id)
+                    cand_token = all_tokens[cand_id]
                     if not cand_token or cand_token == source_token:
                         continue
-                    if self._is_protected_token(cand_token):
+                    cand_bucket = token_shapes[cand_id][2]
+                    if abs(cand_bucket - source_bucket) > 1:
                         continue
+                    checked += 1
                     if _levenshtein(source_token, cand_token) < min_visual:
                         continue
                     cand_vec = vectors_or_matrix[cand_id]
@@ -413,37 +471,41 @@ class SemanticCodebook:
                     continue
                 scored.sort(key=lambda x: x[0], reverse=True)
                 top = scored[:top_k]
-                sims_only = [s for s, _ in top]
                 idx = _hash_to_int(f"{self._secret_salt}:{token_id}") % len(top)
                 chosen_sim, chosen_id = top[idx]
                 forward[token_id] = chosen_id
                 reverse[chosen_id] = token_id
                 cosines.append(chosen_sim)
-                cand_token = self._safe_token_str(chosen_id)
+                cand_token = all_tokens[chosen_id]
                 if cand_token:
                     distances.append(_levenshtein(source_token, cand_token))
                 anchored += 1
                 continue
             if backend == "sentence_transformer":
-                token_strings_all = [self._safe_token_str(i) for i in range(vocab_size)]
-                unique = list(dict.fromkeys(token_strings_all))
+                unique = list(dict.fromkeys(all_tokens))
                 encoder_vecs, encoder_index = anchor.embed_tokens(unique)
                 vec_map = {s: encoder_vecs[encoder_index[s]] for s in unique}
                 source_vec = vec_map.get(source_token)
                 if source_vec is None:
                     continue
-                candidates = self._candidate_token_ids(
-                    token_id, vocab_size, special_ids, source_token
-                )
+                source_key = token_shapes[token_id]
+                group_key = (source_key[0], source_key[1])
+                source_bucket = source_key[2]
+                raw_candidates = shape_index.get(group_key, [])
                 scored = []
-                for cand_id in candidates:
-                    if cand_id == token_id:
+                checked = 0
+                for cand_id in raw_candidates:
+                    if checked >= 50:
+                        break
+                    if cand_id == token_id or not is_obfuscatable[cand_id]:
                         continue
-                    cand_token = self._safe_token_str(cand_id)
+                    cand_token = all_tokens[cand_id]
                     if not cand_token or cand_token == source_token:
                         continue
-                    if self._is_protected_token(cand_token):
+                    cand_bucket = token_shapes[cand_id][2]
+                    if abs(cand_bucket - source_bucket) > 1:
                         continue
+                    checked += 1
                     if _levenshtein(source_token, cand_token) < min_visual:
                         continue
                     cand_vec = vec_map.get(cand_token)
@@ -463,31 +525,30 @@ class SemanticCodebook:
                 forward[token_id] = chosen_id
                 reverse[chosen_id] = token_id
                 cosines.append(chosen_sim)
-                cand_token = self._safe_token_str(chosen_id)
+                cand_token = all_tokens[chosen_id]
                 if cand_token:
                     distances.append(_levenshtein(source_token, cand_token))
                 anchored += 1
                 continue
-            candidates = self._candidate_token_ids(
-                token_id, vocab_size, special_ids, source_token
-            )
-            if not candidates:
-                continue
+            source_key = token_shapes[token_id]
+            group_key = (source_key[0], source_key[1])
+            source_bucket = source_key[2]
+            raw_candidates = shape_index.get(group_key, [])
             scored = []
-            for cand_id in candidates:
-                if cand_id == token_id:
+            checked = 0
+            for cand_id in raw_candidates:
+                if checked >= 50:
+                    break
+                if cand_id == token_id or not is_obfuscatable[cand_id]:
                     continue
-                cand_token = self._safe_token_str(cand_id)
+                cand_token = all_tokens[cand_id]
                 if not cand_token or cand_token == source_token:
                     continue
-                if self._is_protected_token(cand_token):
+                cand_bucket = token_shapes[cand_id][2]
+                if abs(cand_bucket - source_bucket) > 1:
                     continue
+                checked += 1
                 if _levenshtein(source_token, cand_token) < min_visual:
-                    continue
-                src_key = _token_shape_key(source_token)
-                cand_key = _token_shape_key(cand_token)
-                same_class = src_key[1] == cand_key[1] and abs(src_key[2] - cand_key[2]) <= 4
-                if not same_class:
                     continue
                 scored.append((cand_id, cand_token))
             if not scored:

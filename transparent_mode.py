@@ -223,6 +223,7 @@ class TransparentProxyManager:
             env["HF_HUB_NO_ADVISORY_WARNINGS"] = "1"
             env["HF_HUB_DISABLE_TELEMETRY"] = "1"
             env["TOKENIZERS_PARALLELISM"] = "false"
+            env["HF_HUB_OFFLINE"] = "1"
             env.pop("HTTP_PROXY", None)
             env.pop("HTTPS_PROXY", None)
             env.pop("http_proxy", None)
