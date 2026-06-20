@@ -397,54 +397,113 @@ class TransparentAddon:
 
                     self._vaults[req_id] = vault
                     flow.metadata["shield_request_id"] = req_id
+                    flow.metadata["shield_is_streaming"] = data.get("stream", False)
 
                     self.redirections += 1
                     self._write_stats()
+                    self._log(f"[REQ] Masked {len(vault.reverse_map)} entities, streaming={data.get('stream', False)}, obfuscator={self.obfuscator is not None and self.obfuscator.ready}")
 
                 except Exception as e:
                     print(f"[Shield] Intercept masking failure: {e}")
 
+    def _log(self, msg: str) -> None:
+        try:
+            with open(self._debug_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+    def _unmask_and_decode(self, body: dict, vault: RequestVault) -> None:
+        try:
+            self.engine.unmask_response(body, vault)
+        except Exception as exc:
+            self._log(f"[RES] unmask_response failed: {exc}")
+        if self.obfuscator is not None and self.obfuscator.ready:
+            decode_response = os.environ.get(
+                "SEMANTIC_OBFUSCATION_DECODE_RESPONSE", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if decode_response:
+                try:
+                    self.obfuscator.decode_response(body, vault)
+                except Exception as exc:
+                    self._log(f"[RES] obfuscator.decode_response failed: {exc}")
+
+    def _process_sse_line(self, line: str, vault: RequestVault) -> str:
+        if not line.startswith("data: "):
+            return line
+        payload = line[len("data: "):]
+        if payload.strip() == "[DONE]":
+            return line
+        try:
+            chunk = json.loads(payload)
+        except Exception:
+            return line
+        if not isinstance(chunk, dict):
+            return line
+        choices = chunk.get("choices")
+        if not isinstance(choices, list):
+            return line
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    fake_body = {"choices": [{"message": {"content": content}}]}
+                    self._unmask_and_decode(fake_body, vault)
+                    delta["content"] = fake_body["choices"][0]["message"]["content"]
+            message = choice.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content:
+                    fake_body = {"choices": [{"message": {"content": content}}]}
+                    self._unmask_and_decode(fake_body, vault)
+                    message["content"] = fake_body["choices"][0]["message"]["content"]
+        try:
+            return "data: " + json.dumps(chunk, ensure_ascii=False)
+        except Exception:
+            return line
+
     def response(self, flow: Any) -> None:
         req_id = flow.metadata.get("shield_request_id")
-        if req_id and req_id in self._vaults and flow.response and flow.response.content:
+        if not req_id or req_id not in self._vaults:
+            return
+        if not flow.response or not flow.response.content:
+            return
+        try:
+            vault = self._vaults.pop(req_id)
+        except KeyError:
+            return
+        self._log(f"[RES] Response received, vault_entries={len(vault.reverse_map)}, streaming={flow.metadata.get('shield_is_streaming', False)}")
+        raw = flow.response.content.decode("utf-8", errors="replace")
+        is_streaming = flow.metadata.get("shield_is_streaming", False)
+        if is_streaming:
+            lines = raw.split("\n")
+            new_lines = []
+            for line in lines:
+                stripped = line.rstrip("\r")
+                if stripped.startswith("data: "):
+                    new_lines.append(self._process_sse_line(stripped, vault))
+                else:
+                    new_lines.append(line)
+            new_body = "\n".join(new_lines)
             try:
-                vault = self._vaults.pop(req_id)
-                try:
-                    with open(self._debug_path, "a", encoding="utf-8") as f:
-                        f.write(f"[RES] Response received, vault_entries={len(vault.reverse_map)}\n")
-                except Exception:
-                    pass
-                try:
-                    decoded_body = json.loads(flow.response.content.decode("utf-8"))
-                except Exception:
-                    decoded_body = None
-                if isinstance(decoded_body, dict):
-                    try:
-                        self.engine.unmask_response(decoded_body, vault)
-                    except Exception as exc:
-                        try:
-                            with open(self._debug_path, "a", encoding="utf-8") as f:
-                                f.write(f"[RES] unmask_response failed: {exc}\n")
-                        except Exception:
-                            pass
-                    if self.obfuscator is not None and self.obfuscator.ready:
-                        decode_response = os.environ.get(
-                            "SEMANTIC_OBFUSCATION_DECODE_RESPONSE", "false"
-                        ).strip().lower() in {"1", "true", "yes", "on"}
-                        if decode_response:
-                            try:
-                                self.obfuscator.decode_response(decoded_body, vault)
-                            except Exception as exc:
-                                try:
-                                    with open(self._debug_path, "a", encoding="utf-8") as f:
-                                        f.write(f"[RES] obfuscator.decode_response failed: {exc}\n")
-                                except Exception:
-                                    pass
-                    try:
-                        flow.response.content = json.dumps(decoded_body).encode("utf-8")
-                        flow.response.headers["content-length"] = str(len(flow.response.content))
-                    except Exception:
-                        pass
+                flow.response.content = new_body.encode("utf-8")
+                flow.response.headers["content-length"] = str(len(flow.response.content))
+            except Exception:
+                pass
+        else:
+            try:
+                decoded_body = json.loads(raw)
+            except Exception:
+                return
+            if not isinstance(decoded_body, dict):
+                return
+            self._unmask_and_decode(decoded_body, vault)
+            try:
+                flow.response.content = json.dumps(decoded_body, ensure_ascii=False).encode("utf-8")
+                flow.response.headers["content-length"] = str(len(flow.response.content))
             except Exception:
                 pass
 

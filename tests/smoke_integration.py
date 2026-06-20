@@ -363,6 +363,59 @@ def main():
         assert c.semantic_obfuscation_decode_response is False
         print("  ok")
 
+        print("=== addon.response handles SSE streaming response ===")
+        addon, _ = make_addon(tmp, sem_enabled=True, decode_response=True)
+        body = {
+            "model": "x",
+            "messages": [{"role": "user", "content": "tok_20"}],
+        }
+        flow = StubFlow("api.openai.com", "/v1/chat/completions", body)
+        addon.request(flow)
+        req_id = flow.metadata["shield_request_id"]
+        assert flow.metadata.get("shield_is_streaming") is False
+        sse_lines = [
+            'data: {"id":"cmpl-1","choices":[{"index":0,"delta":{"role":"assistant","content":"[M] Hello"}}]}',
+            'data: {"id":"cmpl-1","choices":[{"index":0,"delta":{"content":" tok_21 world"}}]}',
+            "data: [DONE]",
+        ]
+        sse_body = "\n".join(sse_lines)
+        flow.response = SimpleNamespace(
+            headers={"content-type": "text/event-stream"},
+            content=sse_body.encode("utf-8"),
+        )
+        flow.metadata["shield_is_streaming"] = True
+        addon.response(flow)
+        restored = flow.response.content.decode("utf-8")
+        assert "[M]" not in restored, f"SSE unmask failed: {restored!r}"
+        assert "tok_21" not in restored, f"SSE decode failed: {restored!r}"
+        assert "tok_20" in restored, f"SSE should restore original: {restored!r}"
+        assert "[DONE]" in restored, "SSE [DONE] marker must be preserved"
+        print(f"  SSE response processed: {restored[:80]}...")
+        print("  ok")
+
+        print("=== addon.request sets streaming flag ===")
+        addon, _ = make_addon(tmp, sem_enabled=True)
+        body = {
+            "model": "x",
+            "messages": [{"role": "user", "content": "tok_20"}],
+            "stream": True,
+        }
+        flow = StubFlow("api.openai.com", "/v1/chat/completions", body)
+        addon.request(flow)
+        assert flow.metadata.get("shield_is_streaming") is True
+        print("  ok")
+
+        print("=== addon.request non-streaming sets flag false ===")
+        addon, _ = make_addon(tmp, sem_enabled=True)
+        body = {
+            "model": "x",
+            "messages": [{"role": "user", "content": "tok_20"}],
+        }
+        flow = StubFlow("api.openai.com", "/v1/chat/completions", body)
+        addon.request(flow)
+        assert flow.metadata.get("shield_is_streaming") is False
+        print("  ok")
+
     print("ALL TRANSPARENT-MODE INTEGRATION SMOKE TESTS PASSED")
 
 
