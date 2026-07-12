@@ -8,3 +8,5 @@ dist/
 *.exe
 .agent/*.log
 .agent/live_stats.json
+.agent/ca-cert.pem
+.agent/semantic_codebook.json

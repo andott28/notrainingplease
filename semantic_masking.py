@@ -199,6 +199,9 @@ class MaskingEngine:
             return
         choices = response_body.get("choices")
         if not isinstance(choices, list):
+            for k, v in response_body.items():
+                if isinstance(v, str):
+                    response_body[k] = self._unmask_text(v, vault)
             return
         for choice in choices:
             if not isinstance(choice, dict):
@@ -354,9 +357,6 @@ class MaskingEngine:
                 return alias
 
     def _is_unrecoverable_token_substitution_error(self, exc: RuntimeError) -> bool:
-        message = str(exc)
-        if "requires TOKEN_CIPHER_MODEL_ID" in message:
-            return True
         return False
 
     def _ensure_tokenizer_loaded(self) -> None:

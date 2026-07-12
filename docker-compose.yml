@@ -1,0 +1,22 @@
+services:
+  llm-shield:
+    image: llm-shield:latest
+    container_name: llm-shield
+    ports:
+      - "127.0.0.1:8923:8923"
+    volumes:
+      - ./shield_config.json:/addon/shield_config.json:ro
+      - ./.agent:/addon/.agent
+    environment:
+      - MASKING_STRATEGY=token_substitution
+      - SEMANTIC_OBFUSCATION=true
+      - SEMANTIC_OBFUSCATION_LEVEL=standard
+      - SEMANTIC_OBFUSCATION_DECODE_RESPONSE=true
+      - SEMANTIC_OBFUSCATION_INCLUDE_SYSTEM=false
+      - SEMANTIC_OBFUSCATION_LOAD_ANCHOR_BODY=false
+      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+      - HF_HUB_NO_ADVISORY_WARNINGS=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - TOKENIZERS_PARALLELISM=false
+    restart: "no"
+    stop_grace_period: 5s

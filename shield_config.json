@@ -1,0 +1,15 @@
+{
+  "proxy": {
+    "port": 8923,
+    "container_name": "llm-shield",
+    "image": "llm-shield:latest",
+    "mode": "regular"
+  },
+  "provider_toggles": {
+    "openai": true,
+    "anthropic": true,
+    "google": true,
+    "opencode_zen": false,
+    "opencode_go": false
+  }
+}
