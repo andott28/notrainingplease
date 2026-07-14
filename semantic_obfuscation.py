@@ -143,29 +143,28 @@ class _AnchorEmbedder:
     def load(self) -> None:
         if self._backend != "uninitialized":
             return
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        try:
-            from transformers import AutoTokenizer
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True, trust_remote_code=True)
-        except Exception as exc:
-            self._backend = "failed"
-            self._load_error = f"tokenizer load failed: {type(exc).__name__}: {exc}"
-            return
-        if self._load_model_body:
+        if self.model_id and self.model_id not in ("unknown", ""):
             try:
-                from transformers import AutoModel
-                model = AutoModel.from_pretrained(self.model_id, trust_remote_code=True)
-                self._embedding_matrix = model.get_input_embeddings().weight.detach().cpu()
-                del model
-                self._backend = "model_body"
-                return
+                from transformers import AutoTokenizer
+                self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True, trust_remote_code=True)
             except Exception as exc:
-                self._load_error = f"model body load failed: {type(exc).__name__}: {exc}"
+                self._load_error = f"tokenizer load failed: {type(exc).__name__}: {exc}"
+            if self._load_model_body and self._tokenizer is not None:
+                try:
+                    from transformers import AutoModel
+                    model = AutoModel.from_pretrained(self.model_id, trust_remote_code=True)
+                    self._embedding_matrix = model.get_input_embeddings().weight.detach().cpu()
+                    del model
+                    self._backend = "model_body"
+                    return
+                except Exception as exc:
+                    self._load_error = f"model body load failed: {type(exc).__name__}: {exc}"
         try:
             from sentence_transformers import SentenceTransformer
             encoder = SentenceTransformer("all-MiniLM-L6-v2")
             self._sentence_encoder = encoder
             self._backend = "sentence_transformer"
+            os.environ["HF_HUB_OFFLINE"] = "1"
         except Exception as exc:
             self._load_error += f" | sentence-transformer load failed: {type(exc).__name__}: {exc}"
             self._backend = "fallback_shape_only"
@@ -429,6 +428,10 @@ class SemanticCodebook:
             for t in all_tokens
         ]
         shape_index = self._build_shape_index(vocab_size, special_ids)
+        if backend == "sentence_transformer":
+            unique_tokens = list(dict.fromkeys(all_tokens))
+            encoder_vecs, encoder_index = anchor.embed_tokens(unique_tokens)
+            vec_map = {s: encoder_vecs[encoder_index[s]] for s in unique_tokens}
         for token_id in range(vocab_size):
             if not is_obfuscatable[token_id]:
                 if all_tokens[token_id] and all_tokens[token_id].strip() and all_tokens[token_id] in PROTECTED_IDENTIFIERS:
@@ -478,9 +481,6 @@ class SemanticCodebook:
                 anchored += 1
                 continue
             if backend == "sentence_transformer":
-                unique = list(dict.fromkeys(all_tokens))
-                encoder_vecs, encoder_index = anchor.embed_tokens(unique)
-                vec_map = {s: encoder_vecs[encoder_index[s]] for s in unique}
                 source_vec = vec_map.get(source_token)
                 if source_vec is None:
                     continue
@@ -626,25 +626,15 @@ class SemanticCodebook:
     @staticmethod
     def _cosine(a: Any, b: Any) -> float:
         try:
-            import math
-            dot = 0.0
-            na = 0.0
-            nb = 0.0
-            if hasattr(a, "__iter__") and hasattr(b, "__iter__") and not hasattr(a, "numel"):
-                for x, y in zip(a, b):
-                    dot += float(x) * float(y)
-                    na += float(x) * float(x)
-                    nb += float(y) * float(y)
-            else:
-                a_list = a.tolist() if hasattr(a, "tolist") else list(a)
-                b_list = b.tolist() if hasattr(b, "tolist") else list(b)
-                for x, y in zip(a_list, b_list):
-                    dot += float(x) * float(y)
-                    na += float(x) * float(x)
-                    nb += float(y) * float(y)
+            import numpy as np
+            a_np = np.asarray(a, dtype=np.float64)
+            b_np = np.asarray(b, dtype=np.float64)
+            dot = np.dot(a_np, b_np)
+            na = np.dot(a_np, a_np)
+            nb = np.dot(b_np, b_np)
             if na == 0.0 or nb == 0.0:
                 return 0.0
-            return dot / (math.sqrt(na) * math.sqrt(nb))
+            return float(dot / (np.sqrt(na) * np.sqrt(nb)))
         except Exception:
             return 0.0
 
